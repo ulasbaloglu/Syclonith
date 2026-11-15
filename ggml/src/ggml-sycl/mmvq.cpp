@@ -2986,19 +2986,26 @@ static void launch_mul_mat_vec_q_moe_reorder(
 }
 
 // Q6_K MoE decode reuses each activation fragment across several output rows.
-// Two rows is the established default; larger groups reduce activation traffic but
-// also reduce the number of independent subgroups and increase register pressure.
-// Keep the choice runtime-tunable so it can be measured on each Intel GPU generation.
-static int ggml_sycl_moe_q6_rows_per_sg() {
+// Single-token decode (src1_row_stride == 0) uses one row per subgroup: this was
++// the faster configuration in the Q6_K decode measurements. For multi-token
++// batches, retain the two-row default until a separate prompt-batch policy is
++// selected. The environment override remains available for controlled tuning.
++static int ggml_sycl_moe_q6_rows_per_sg(const size_t src1_row_stride) {
++    static const int override_rows = [] {
     static const int rows = [] {
         const char * e = getenv("GGML_SYCL_MOE_Q6_ROWS_PER_SG");
         if (e == nullptr || e[0] == '\0') {
-            return 2;
+            return 0;
         }
         const int value = atoi(e);
-        return value == 1 || value == 2 || value == 4 ? value : 2;
+        return value == 1 || value == 2 || value == 4 ? value : 0;
     }();
-    return rows;
+
+    if (override_rows != 0) {
++        return override_rows;
++    }
++
++    return src1_row_stride == 0 ? 1 : 2;
 }
 
 template <typename reorder_vec_dot_q_sycl,
@@ -3009,7 +3016,7 @@ static void launch_mul_mat_vec_q_moe_reorder_q6(
     const size_t expert_weight_stride, const size_t dst_row_stride,
     const size_t src1_row_stride, dpct::queue_ptr stream) {
     if constexpr (shared_activations) {
-        switch (ggml_sycl_moe_q6_rows_per_sg()) {
+        switch (ggml_sycl_moe_q6_rows_per_sg(src1_row_stride)) {
             case 1:
                 launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl, 1>(
                     vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
