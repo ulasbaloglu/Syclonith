@@ -38,6 +38,7 @@ class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
+class llama_moe_cache_sycl;
 
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
@@ -814,6 +815,7 @@ struct llm_graph_params {
 
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
+    llama_moe_cache_sycl * moe_cache_sycl = nullptr;
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
@@ -1059,6 +1061,7 @@ struct llm_graph_context {
     const enum llama_rope_type    rope_type;
 
     ggml_backend_sched_t sched;
+    llama_moe_cache_sycl * moe_cache_sycl;
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
@@ -1117,7 +1120,12 @@ struct llm_graph_context {
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+              ggml_tensor * slots = nullptr) const;
+
+    ggml_tensor * build_moe_cache_slots(ggml_tensor * selected_experts,
+              ggml_tensor * gate_up_exps, ggml_tensor * gate_exps,
+              ggml_tensor * up_exps, ggml_tensor * down_exps, int il) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

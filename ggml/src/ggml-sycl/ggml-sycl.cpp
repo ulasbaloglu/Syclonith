@@ -5130,6 +5130,12 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
 
 // Lazily reorder supported MoE expert weights once their fused path is used.
 static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
+    // Stage A SYCL MoE cache banks are populated slot-by-slot after graph
+    // construction. Do not permanently reorder the bank in place: a later LRU
+    // fill writes source-layout bytes into the evicted slot.
+    if (std::strncmp(src0->name, "sycl_moe_cache.bank.", sizeof("sycl_moe_cache.bank.") - 1) == 0) {
+        return;
+    }
     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
         return;
     }

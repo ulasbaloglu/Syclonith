@@ -4,6 +4,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-moe-cache-sycl.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -1661,6 +1662,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
     sched            (params.sched),
+    moe_cache_sycl   (params.moe_cache_sycl),
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
     loras            (params.loras),
@@ -1732,8 +1734,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
-          ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+          ggml_tensor * w_s,
+          ggml_tensor * slots) const {
+    ggml_tensor * weight = slots != nullptr && moe_cache_sycl != nullptr ? moe_cache_sycl->get_experts(w) : nullptr;
+    GGML_ASSERT(slots == nullptr || weight != nullptr);
+    ggml_tensor * res = ggml_mul_mat_id(ctx0, weight != nullptr ? weight : w, cur, slots != nullptr ? slots : ids);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2145,6 +2150,35 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_moe_cache_slots(ggml_tensor * selected_experts,
+        ggml_tensor * gate_up_exps, ggml_tensor * gate_exps,
+        ggml_tensor * up_exps, ggml_tensor * down_exps, int il) const {
+    if (moe_cache_sycl == nullptr || !moe_cache_sycl->active() || selected_experts == nullptr ||
+        !ggml_is_contiguous(selected_experts)) {
+        return nullptr;
+    }
+
+    for (ggml_tensor * weight : { gate_up_exps, gate_exps, up_exps, down_exps }) {
+        if (weight != nullptr && moe_cache_sycl->get_experts(weight) == nullptr) {
+            return nullptr;
+        }
+    }
+
+    ggml_tensor * slot_map = moe_cache_sycl->get_slot_map(il, n_tokens, n_expert_used);
+    if (slot_map == nullptr) {
+        return nullptr;
+    }
+
+    ggml_tensor * ids = ggml_reshape_1d(ctx0, selected_experts, ggml_nelements(selected_experts));
+    ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids);
+    ggml_backend_t backend = moe_cache_sycl->backend(il);
+    GGML_ASSERT(backend != nullptr);
+    ggml_backend_sched_set_tensor_backend(sched, slots, backend);
+    cb(slots, "ffn_moe_slots", il);
+    ggml_build_forward_expand(gf, slots);
+    return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]);
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2353,6 +2387,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // Stage A SYCL cache: map selected expert IDs to resident bank slots. Large batches
+    // and unsupported layers keep the original full-weight path.
+    ggml_tensor * cache_slots = build_moe_cache_slots(selected_experts, gate_up_exps, gate_exps, up_exps, down_exps, il);
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -2367,7 +2405,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, cache_slots); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2386,7 +2424,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, cache_slots); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2399,7 +2437,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, cache_slots); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2537,7 +2575,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return moe_out;
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, cache_slots); // [n_embd, n_expert_used, n_tokens]
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);

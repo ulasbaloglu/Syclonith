@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-moe-cache-sycl.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -1064,6 +1066,35 @@ void llama_context::sched_reserve() {
         }
     }
 
+    // Stage A SYCL expert-slot cache is explicitly opt-in. The CUDA provider and
+    // its existing global cache API remain unchanged.
+    if (!moe_cache_sycl && !model.hparams.no_alloc && !cparams.pipeline_parallel) {
+        const char * budget_env = std::getenv("GGML_SYCL_MOE_CACHE_MB");
+        if (budget_env != nullptr && budget_env[0] != '\0') {
+            char * end = nullptr;
+            const unsigned long long budget_mib = std::strtoull(budget_env, &end, 10);
+            if (end != budget_env && *end == '\0' && budget_mib > 0 && budget_mib <= SIZE_MAX / (1024ull * 1024ull)) {
+                try {
+                    moe_cache_sycl.reset(new llama_moe_cache_sycl(model, backend_ptrs,
+                        (size_t) budget_mib * 1024ull * 1024ull));
+                    if (!moe_cache_sycl->active()) {
+                        moe_cache_sycl.reset();
+                        LLAMA_LOG_WARN("%s: GGML_SYCL_MOE_CACHE_MB was set, but no compatible host-resident SYCL MoE layers were found\n", __func__);
+                    }
+                } catch (const std::exception & e) {
+                    moe_cache_sycl.reset();
+                    LLAMA_LOG_WARN("%s: SYCL MoE cache disabled: %s\n", __func__, e.what());
+                }
+            } else {
+                LLAMA_LOG_WARN("%s: ignoring invalid GGML_SYCL_MOE_CACHE_MB value '%s'\n", __func__, budget_env);
+            }
+        }
+    }
+    if (sched) {
+        ggml_backend_sched_set_copy_callback(sched.get(),
+            moe_cache_sycl ? llama_moe_cache_sycl::copy_callback : nullptr, moe_cache_sycl.get());
+    }
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -1111,6 +1142,8 @@ void llama_context::sched_reserve() {
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), cap_nodes, false, cparams.op_offload));
                 sched_max_nodes = cap_nodes;
                 set_moe_cache();
+                ggml_backend_sched_set_copy_callback(sched.get(),
+                    moe_cache_sycl ? llama_moe_cache_sycl::copy_callback : nullptr, moe_cache_sycl.get());
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             // A batch's tensors grow with it: on a small card no pool of the MoE cache may hold one of them in one
@@ -3848,6 +3881,7 @@ llm_graph_params llama_context::graph_params(
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
+        /*.moe_cache_sycl =*/ moe_cache_sycl.get(),
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,

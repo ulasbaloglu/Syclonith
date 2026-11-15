@@ -17,6 +17,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+class llama_moe_cache_sycl;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -464,6 +465,7 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    std::unique_ptr<llama_moe_cache_sycl> moe_cache_sycl;
 
     size_t sched_max_nodes = 0; // the size of sched, see sched_reserve
     void * moe_cache_shared = nullptr; // the MoE cache session of another context, see share_moe_cache
