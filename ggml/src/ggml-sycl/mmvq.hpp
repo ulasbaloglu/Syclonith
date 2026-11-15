@@ -46,6 +46,25 @@ bool ggml_sycl_mul_mat_vec_q_id(
     size_t             src1_row_stride,      // 0 = shared src1, else per-expert stride in bytes
     dpct::queue_ptr    stream);
 
+// Fused Q6_K MoE gate + up + GLU for single-token decode.
+// Both expert tensors must use the Q6_K reorder/SoA layout.
+bool ggml_sycl_mul_mat_vec_q_id_glu_reorder(
+    enum ggml_type     src0_type,
+    enum ggml_glu_op   glu_op,
+    const void *       vx_base,
+    const void *       vgate_base,
+    const void *       vy,
+    const int32_t *    ids_dev,
+    float *            dst_base,
+    int                ncols,
+    int                nrows,
+    int                n_experts_used,
+    size_t             up_expert_stride,
+    size_t             gate_expert_stride,
+    size_t             dst_row_stride,
+    size_t             src1_row_stride,
+    dpct::queue_ptr    stream);
+
 // Reorder (SoA) variant of the fused MoE expert GEMV.
 // vx_base: each expert slice (stride expert_weight_stride == src0->nb[2]) is a self-contained reorder/SoA layout.
 // vy: src1 quantized with quantize_and_reorder_q8_1_soa (per-row SoA). Returns false if src0_type isn't handled.

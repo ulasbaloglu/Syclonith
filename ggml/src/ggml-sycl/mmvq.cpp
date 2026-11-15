@@ -2986,13 +2986,10 @@ static void launch_mul_mat_vec_q_moe_reorder(
 }
 
 // Q6_K MoE decode reuses each activation fragment across several output rows.
-// Single-token decode (src1_row_stride == 0) uses one row per subgroup: this was
-+// the faster configuration in the Q6_K decode measurements. For multi-token
-+// batches, retain the two-row default until a separate prompt-batch policy is
-+// selected. The environment override remains available for controlled tuning.
-+static int ggml_sycl_moe_q6_rows_per_sg(const size_t src1_row_stride) {
-+    static const int override_rows = [] {
-    static const int rows = [] {
+// Single-token decode uses one row per subgroup; multi-token batches retain two.
+// The environment override remains available for controlled tuning.
+static int ggml_sycl_moe_q6_rows_per_sg(const size_t src1_row_stride) {
+    static const int override_rows = [] {
         const char * e = getenv("GGML_SYCL_MOE_Q6_ROWS_PER_SG");
         if (e == nullptr || e[0] == '\0') {
             return 0;
@@ -3002,10 +2999,10 @@ static void launch_mul_mat_vec_q_moe_reorder(
     }();
 
     if (override_rows != 0) {
-+        return override_rows;
-+    }
-+
-+    return src1_row_stride == 0 ? 1 : 2;
+        return override_rows;
+    }
+
+    return src1_row_stride == 0 ? 1 : 2;
 }
 
 template <typename reorder_vec_dot_q_sycl,
@@ -3038,6 +3035,119 @@ static void launch_mul_mat_vec_q_moe_reorder_q6(
             vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
             expert_weight_stride, dst_row_stride, src1_row_stride, stream);
     }
+}
+
+
+// Q6_K MoE gate + up + GLU: one subgroup computes one routed expert/output row.
+// The single-token activation is loaded once and applied to both reordered weight matrices.
+template <typename reorder_vec_dot_q_sycl>
+static void mul_mat_vec_q_moe_reorder_glu_q6(
+    const void * __restrict__ vx_base, const void * __restrict__ vgate_base,
+    const void * __restrict__ vy, const int32_t * __restrict__ ids_dev,
+    float * __restrict__ dst_base, const int ncols, const int nrows,
+    const size_t up_expert_stride, const size_t gate_expert_stride,
+    const size_t dst_row_stride, const ggml_glu_op glu_op,
+    const sycl::nd_item<3> & item) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+
+    const int expert_idx = item.get_group(1);
+    const int expert_id  = ids_dev[expert_idx];
+    const int row = item.get_group(2) * item.get_local_range(1) + item.get_local_id(1);
+    if (row >= nrows) {
+        return;
+    }
+
+    float * dst = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
+    if (expert_id < 0) {
+        if (item.get_local_id(2) == 0) {
+            dst[row] = 0.0f;
+        }
+        return;
+    }
+
+    const char * vx = (const char *) vx_base + (size_t) expert_id * up_expert_stride;
+    const char * vg = (const char *) vgate_base + (size_t) expert_id * gate_expert_stride;
+    const auto sg = item.get_sub_group();
+    const int blocks_per_row = ncols / block_traits::qk;
+    const int nblocks = nrows * blocks_per_row;
+    constexpr int blocks_per_subgroup =
+        ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+
+    static_assert(blocks_per_subgroup > 0);
+    static_assert(block_elements_per_subgroup > 0);
+    static_assert(reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q6_K,
+                  "the fused MoE gate/up kernel is currently Q6_K-specific");
+
+    float partial_up = 0.0f;
+    float partial_gate = 0.0f;
+    for (int i = sg.get_local_linear_id() / block_elements_per_subgroup;
+         i < blocks_per_row; i += blocks_per_subgroup) {
+        const int iby = i * block_type::block_to_q8_1_ratio();
+#pragma unroll
+        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+            const int iqs = elem + block_traits::vdr_mmvq *
+                (sg.get_local_linear_id() % block_elements_per_subgroup);
+            const int ibx = row * blocks_per_row + i;
+            const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+            const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+            const auto up_weights = reorder_vec_dot_q_sycl::load(vx, bx_offset, d_offset, iqs);
+            const auto gate_weights = reorder_vec_dot_q_sycl::load(vg, bx_offset, d_offset, iqs);
+            const int8_t * q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
+            const sycl::half2 * q8_1_ds_ptr = (const sycl::half2 *)
+                ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+            const auto activations =
+                reorder_vec_dot_q_sycl::load_activations(q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+            partial_up += reorder_vec_dot_q_sycl::apply(up_weights, activations);
+            partial_gate += reorder_vec_dot_q_sycl::apply(gate_weights, activations);
+        }
+    }
+
+    const float up_sum = sycl::reduce_over_group(sg, partial_up, std::plus<>());
+    const float gate_sum = sycl::reduce_over_group(sg, partial_gate, std::plus<>());
+    if (sg.leader()) {
+        const float activated_gate =
+            glu_op == GGML_GLU_OP_SWIGLU ? op_silu(gate_sum) : op_gelu(gate_sum);
+        dst[row] = up_sum * activated_gate;
+    }
+}
+
+static void launch_mul_mat_vec_q_moe_reorder_glu_q6(
+    const void * vx_base, const void * vgate_base, const void * vy,
+    const int32_t * ids_dev, float * dst_base,
+    const int ncols, const int nrows, const int n_experts_used,
+    const size_t up_expert_stride, const size_t gate_expert_stride,
+    const size_t dst_row_stride, const ggml_glu_op glu_op, dpct::queue_ptr stream) {
+    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y);
+    const sycl::range<3> block_nums(1, (unsigned) n_experts_used, (unsigned) block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_q_moe_reorder_glu_q6<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(
+                    vx_base, vgate_base, vy, ids_dev, dst_base, ncols, nrows,
+                    up_expert_stride, gate_expert_stride, dst_row_stride, glu_op, item);
+            });
+    });
+}
+
+bool ggml_sycl_mul_mat_vec_q_id_glu_reorder(
+    enum ggml_type src0_type, enum ggml_glu_op glu_op,
+    const void * vx_base, const void * vgate_base, const void * vy,
+    const int32_t * ids_dev, float * dst_base,
+    int ncols, int nrows, int n_experts_used,
+    size_t up_expert_stride, size_t gate_expert_stride,
+    size_t dst_row_stride, size_t src1_row_stride, dpct::queue_ptr stream) {
+    if (src0_type != GGML_TYPE_Q6_K || src1_row_stride != 0 ||
+        (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU)) {
+        return false;
+    }
+    launch_mul_mat_vec_q_moe_reorder_glu_q6(
+        vx_base, vgate_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+        up_expert_stride, gate_expert_stride, dst_row_stride, glu_op, stream);
+    return true;
 }
 
 bool ggml_sycl_mul_mat_vec_q_id_reorder(

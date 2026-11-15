@@ -82,6 +82,41 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     return true;
 }
 
+// Q6_K MoE gate/up + GLU: a single-token MUL_MAT_ID pair with shared routing IDs.
+static bool ggml_sycl_should_fuse_moe_mul_mat_id_glu(
+        const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * glu) {
+    const ggml_glu_op glu_op = ggml_get_glu_op(glu);
+    if ((glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) ||
+        ggml_get_op_params_i32(glu, 1) /* swapped */) {
+        return false;
+    }
+
+    const ggml_tensor * wg  = gate->src[0];
+    const ggml_tensor * wu  = up->src[0];
+    const ggml_tensor * act = up->src[1];
+    const ggml_tensor * ids = up->src[2];
+    if (!ggml_are_same_shape(wu, wg) || act != gate->src[1] || ids != gate->src[2]) {
+        return false;
+    }
+    if (wu->type != GGML_TYPE_Q6_K || wg->type != GGML_TYPE_Q6_K ||
+        gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+        act->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(wu) || !ggml_is_contiguous(wg) ||
+        !ggml_is_contiguous(act) || !ggml_is_contiguous(ids) || !ggml_is_contiguous(glu)) {
+        return false;
+    }
+    if (wu->ne[0] % QK_K != 0 || wu->ne[2] <= 1 || wu->ne[3] != 1 ||
+        act->ne[0] != wu->ne[0] || act->ne[1] != 1 || act->ne[2] != 1 || act->ne[3] != 1 ||
+        ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        ids->ne[0] != glu->ne[1] || glu->ne[0] != wu->ne[1] ||
+        glu->ne[2] != 1 || glu->ne[3] != 1) {
+        return false;
+    }
+    return true;
+}
+
 // the unary ops the fused unary chains in element_wise.cpp have a functor for
 static bool ggml_sycl_fused_unary_has_kernel(ggml_unary_op unary_op) {
     return unary_op == GGML_UNARY_OP_SILU || unary_op == GGML_UNARY_OP_SIGMOID ||
@@ -119,6 +154,22 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         }
 
         return ggml_sycl_should_fuse_mul_mat_glu(gate, up, glu);
+    }
+
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_MUL_MAT_ID &&
+        ops.begin()[1] == GGML_OP_MUL_MAT_ID && ops.begin()[2] == GGML_OP_GLU) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+            return false;
+        }
+        const ggml_tensor * glu  = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * gate = glu->src[0];
+        const ggml_tensor * up   = glu->src[1];
+        const bool ok = (gate == cgraph->nodes[node_idx] && up == cgraph->nodes[node_idx + 1]) ||
+                        (gate == cgraph->nodes[node_idx + 1] && up == cgraph->nodes[node_idx]);
+        if (!ok) {
+            return false;
+        }
+        return ggml_sycl_should_fuse_moe_mul_mat_id_glu(gate, up, glu);
     }
 
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {

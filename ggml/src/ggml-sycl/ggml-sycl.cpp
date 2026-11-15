@@ -5737,6 +5737,73 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
         src1_row_stride, stream);
 }
 
+// Fused Q6_K MoE gate/up/GLU for single-token decode. Unsupported cases use
+// the existing per-node/per-expert path.
+static bool ggml_sycl_mul_mat_id_glu_fused(
+    ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_sycl_can_fuse(cgraph, node_idx,
+                            { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, {})) {
+        return false;
+    }
+
+    ggml_tensor * glu  = cgraph->nodes[node_idx + 2];
+    ggml_tensor * gate = glu->src[0];
+    ggml_tensor * up   = glu->src[1];
+    const ggml_tensor * wg  = gate->src[0];
+    const ggml_tensor * wu  = up->src[0];
+    const ggml_tensor * act = up->src[1];
+    const ggml_tensor * ids = up->src[2];
+
+    if (gate->src[1] != act || gate->src[2] != ids ||
+        wu->type != GGML_TYPE_Q6_K || wg->type != GGML_TYPE_Q6_K ||
+        act->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+        up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+        act->ne[1] != 1 || act->ne[2] != 1 || act->ne[3] != 1 ||
+        ids->type != GGML_TYPE_I32 || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        !ggml_is_contiguous(act) || !ggml_is_contiguous(ids) ||
+        !ggml_are_same_shape(gate, up) || !ggml_are_same_shape(glu, up) ||
+        wu->ne[0] != wg->ne[0] || wu->ne[1] != wg->ne[1] ||
+        wu->ne[2] != wg->ne[2] || wu->ne[3] != 1 || ids->ne[0] != gate->ne[1] ||
+        ggml_sycl_mul_mat_id_needs_sync(gate) || ggml_sycl_mul_mat_id_needs_sync(up) ||
+        ggml_backend_buffer_is_sycl_split(wu->buffer) || ggml_backend_buffer_is_sycl_split(wg->buffer)) {
+        return false;
+    }
+
+    const ggml_glu_op glu_op = ggml_get_glu_op(glu);
+    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
+        return false;
+    }
+
+    opt_for_reorder_id(&ctx, wu);
+    opt_for_reorder_id(&ctx, wg);
+    const auto * extra_u = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
+    const auto * extra_g = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
+    if (!extra_u || !extra_g ||
+        !extra_u->optimized_feature.reorder || !extra_g->optimized_feature.reorder) {
+        return false;
+    }
+
+    scope_op_debug_print scope_dbg_print(
+        __func__, up, /*num_src=*/2, " : fused Q6_K MoE gate + up + GLU");
+    const int64_t ne00 = wu->ne[0];
+    const int n_experts_used = (int) ids->ne[0];
+    const int nrows = (int) wu->ne[1];
+    const int src1_padded_cols = GGML_PAD((int) ne00, MATRIX_ROW_PADDING);
+    ggml_sycl_pool_alloc<char> src1_q8_alloc(
+        ctx.pool(), (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+    char * src1_ddq = src1_q8_alloc.get();
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+        (const float *) act->data, src1_ddq, (int) ne00, /*nrows=*/1,
+        src1_padded_cols, ctx.stream());
+
+    return ggml_sycl_mul_mat_vec_q_id_glu_reorder(
+        GGML_TYPE_Q6_K, glu_op, wu->data, wg->data, src1_ddq,
+        (const int32_t *) ids->data, (float *) glu->data,
+        (int) ne00, nrows, n_experts_used,
+        /*up_expert_stride=*/wu->nb[2], /*gate_expert_stride=*/wg->nb[2],
+        /*dst_row_stride=*/glu->nb[1], /*src1_row_stride=*/0, ctx.stream());
+}
+
 // counting sort of the routed rows by expert id (row_id_i, as chosen by the router):
 // builds a projection of a memory layout where each expert's slice is contiguous
 static void mmid_counting_sort_rows(
@@ -6757,6 +6824,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
             i += nodes_to_skip;
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT_ID &&
+            ggml_sycl_mul_mat_id_glu_fused(*sycl_ctx, cgraph, i)) {
+            i += 2;
             continue;
         }
 #ifndef NDEBUG
