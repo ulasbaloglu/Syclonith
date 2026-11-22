@@ -109,6 +109,12 @@ add_library(${TARGET}
     sampling.h
     speculative.cpp
     speculative.h
+    speculative_adapter_registry.cpp
+    speculative_adapter_registry.h
+    speculative_qwen35moe_adapter.cpp
+    speculative_qwen35moe_adapter.h
+    speculative_backend_llama.cpp
+    speculative_backend_llama.h
     subproc.cpp
     subproc.h
     trie.cpp

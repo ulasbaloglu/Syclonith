@@ -34,8 +34,9 @@
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
-        case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
-        case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
+        case LLAMA_CONTEXT_TYPE_DEFAULT  : return LLM_GRAPH_TYPE_DEFAULT;
+        case LLAMA_CONTEXT_TYPE_MTP      : return LLM_GRAPH_TYPE_DECODER_MTP;
+        case LLAMA_CONTEXT_TYPE_SYCLONITH: return LLM_GRAPH_TYPE_DECODER_SYCLONITH;
     }
     throw std::runtime_error("Unsupported ctx type");
 }
@@ -510,7 +511,9 @@ llama_context::llama_context(
                 // again for every piece of a prefill, they must stay in the caches
                 auto set_weights_read_once_fn = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_weights_read_once");
                 if (set_weights_read_once_fn) {
-                    set_weights_read_once_fn(backend.get(), cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP);
+                    set_weights_read_once_fn(backend.get(),
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_SYCLONITH);
                 }
             }
         }
@@ -2047,7 +2050,13 @@ static bool llama_ubatch_timing() {
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool launch) {
-    const bool ut = llama_ubatch_timing() && ubatch.n_tokens > 1024;
+    const bool ut = llama_ubatch_timing() && (
+            ubatch.n_tokens > 1024 ||
+            ((gtype == LLM_GRAPH_TYPE_DECODER ||
+              gtype == LLM_GRAPH_TYPE_DECODER_SYCLONITH) &&
+             ubatch.n_tokens <= 8 &&
+             getenv("LLAMA_UBATCH_TIMING_SMALL") &&
+             atoi(getenv("LLAMA_UBATCH_TIMING_SMALL")) != 0));
     int64_t ut_t[8] = {};
     if (ut) { ut_t[0] = ggml_time_us(); }
     if (mctx && !mctx->apply()) {
@@ -2157,9 +2166,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_synchronize(sched.get());
         ut_t[7] = ggml_time_us();
         const auto ms = [&](int a, int b) { return ut_t[a] && ut_t[b] ? (ut_t[b] - ut_t[a]) / 1e3 : 0.0; };
-        LLAMA_LOG_INFO("%s: ubatch timing (%u tokens%s): since the previous one's end %.1f, apply %.1f, build %.1f, alloc %.1f, "
+        LLAMA_LOG_INFO("%s: ubatch timing (graph=%d, %u tokens%s): since the previous one's end %.1f, apply %.1f, build %.1f, alloc %.1f, "
                 "inputs %.1f, kv %.1f, launch %.1f, gpu wait %.1f ms\n",
-                __func__, ubatch.n_tokens, ut_t[1] ? "" : ", graph reused", ut_after_us ? (ut_t[0] - ut_after_us) / 1e3 : 0.0,
+                __func__, (int) gtype, ubatch.n_tokens, ut_t[1] ? "" : ", graph reused", ut_after_us ? (ut_t[0] - ut_after_us) / 1e3 : 0.0,
                 ut_t[1] ? ms(0, 1) : ms(0, 3), ms(1, 2), ms(2, 3), ms(3, 4), ms(4, 5), ms(5, 6), ms(6, 7));
         ut_after_us = ut_t[7];
     }
@@ -5351,9 +5360,15 @@ llama_context * llama_init_from_model(
     }
 
     // router_layer >= 0 means n_layer_nextn is repurposed for a router layer, not real MTP
-    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+    if ((params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
+         params.ctx_type == LLAMA_CONTEXT_TYPE_SYCLONITH) &&
         (model->hparams.n_layer_nextn == 0 || model->hparams.router_layer >= 0)) {
         LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
+        return nullptr;
+    }
+
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_SYCLONITH && model->arch != LLM_ARCH_QWEN35MOE) {
+        LLAMA_LOG_WARN("%s: Syclonith context currently supports Qwen35MoE only\n", __func__);
         return nullptr;
     }
 
