@@ -2259,8 +2259,9 @@ struct llama_model_inkling2 : public llama_model_base {
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
-        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
-        ggml_tensor * convolve(ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * dynamic, ggml_tensor * state, ggml_tensor * history, llm_graph_input_rs * inp, int64_t offset);
+        std::map<std::vector<ggml_tensor *>, ggml_tensor *> mix_stacks;
+        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, ggml_tensor * tau = nullptr);
+        ggml_tensor * convolve(ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * dynamic, ggml_tensor * state, ggml_tensor * history, llm_graph_input_rs * inp, int64_t offset, ggml_tensor * residual = nullptr);
         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
 
     protected:

@@ -10652,9 +10652,9 @@ void ggml_compute_forward_glu(
                 ggml_compute_forward_geglu_quick(params, dst);
             } break;
         case GGML_GLU_OP_SWIGLU_CLAMP:
-            {
-                ggml_compute_forward_swiglu_clamp(params, dst);
-            } break;
+            { ggml_compute_forward_swiglu_clamp(params, dst); } break;
+        case GGML_GLU_OP_SITU:
+            { ggml_compute_forward_situ(params, dst); } break;
         default:
             {
                 GGML_ABORT("fatal error");
@@ -12810,4 +12810,66 @@ void ggml_compute_forward_qsa_select(const ggml_compute_params * params, ggml_te
             }
         }
     }
+}
+
+
+// Inkling 2 fused operators. These are also used as the reference implementation for SYCL.
+void ggml_compute_forward_loop_gate(const ggml_compute_params * p, ggml_tensor * d) {
+    const ggml_tensor * h=d->src[0], *g=d->src[1], *f=d->src[2], *c=d->src[3], *m=d->src[4];
+    const int64_t rank=h->ne[0], nt=h->ne[1], n=g->ne[1];
+    for (int64_t z=p->ith; z<n*nt; z+=p->nth) {
+        const int64_t i=z%n,t=z/n;
+        const float *hv=(const float*)((const char*)h->data+t*h->nb[1]);
+        const float *gw=(const float*)((const char*)g->data+i*g->nb[1]);
+        const float *fw=(const float*)((const char*)f->data+i*f->nb[1]);
+        float a=0,b=0; for(int64_t j=0;j<rank;++j){a+=gw[j]*hv[j];b+=fw[j]*hv[j];}
+        const float cv=*(const float*)((const char*)c->data+i*sizeof(float)+t*c->nb[1]);
+        const float mv=*(const float*)((const char*)m->data+i*sizeof(float)+t*m->nb[1]);
+        *(float*)((char*)d->data+i*sizeof(float)+t*d->nb[1])=(1.0f-tanhf(b))*cv+tanhf(a)*mv;
+    }
+}
+void ggml_compute_forward_depth_mix(const ggml_compute_params * p, ggml_tensor * d) {
+    const ggml_tensor *q=d->src[0],*cur=d->src[1],*blocks=d->src[2];
+    const float eps=ggml_get_op_params_f32(d,0),scale=ggml_get_op_params_f32(d,1);
+    const int64_t ne=q->ne[0],nq=q->ne[1],nt=cur->ne[1],k=blocks?blocks->ne[1]:0,ns=k+1;
+    for(int64_t z=p->ith;z<nq*nt;z+=p->nth){
+        const int64_t qi=z%nq,t=z/nq; const float *qv=(const float*)((const char*)q->data+qi*q->nb[1]);
+        const float *xs[8]; float inv[8],score[8],mx=-INFINITY;
+        for(int64_t a=0;a<ns;++a){
+            xs[a]=a<k?(const float*)((const char*)blocks->data+a*blocks->nb[1]+t*blocks->nb[2]):(const float*)((const char*)cur->data+t*cur->nb[1]);
+            double ss=0,dot=0;for(int64_t e=0;e<ne;++e){ss+=(double)xs[a][e]*xs[a][e];dot+=(double)xs[a][e]*qv[e];}
+            inv[a]=1.0f/sqrtf((float)(ss/ne)+eps);score[a]=scale*inv[a]*(float)dot;mx=std::max(mx,score[a]);
+        }
+        float sum=0;for(int64_t a=0;a<ns;++a){score[a]=expf(score[a]-mx);sum+=score[a];}
+        for(int64_t a=0;a<ns;++a)score[a]=score[a]/sum*inv[a];
+        float*out=(float*)((char*)d->data+qi*d->nb[1]+t*d->nb[2]);
+        for(int64_t e=0;e<ne;++e){float v=0;for(int64_t a=0;a<ns;++a)v+=score[a]*xs[a][e];out[e]=v;}
+    }
+}
+void ggml_compute_forward_rel_mask(const ggml_compute_params *p,ggml_tensor*d){
+    const ggml_tensor *tab=d->src[0],*idx=d->src[1],*mask=d->src[2],*sink=d->src[3];
+    const int h0=ggml_get_op_params_i32(d,0);const int64_t nk=idx->ne[0],nq=idx->ne[1],nh=d->ne[2],nr=tab->ne[1];
+    for(int64_t z=p->ith;z<nq*nh;z+=p->nth){int64_t q=z%nq,h=z/nq;const int32_t*ix=(const int32_t*)((const char*)idx->data+q*idx->nb[1]);
+        const char*mr=(const char*)mask->data+q*mask->nb[1];const char*tr=(const char*)tab->data+(h0+h)*tab->nb[0]+q*tab->nb[2];
+        float sk=sink?*(const float*)((const char*)sink->data+(h0+h)*sizeof(float)+q*sink->nb[1]):0.0f;
+        ggml_fp16_t*out=(ggml_fp16_t*)((char*)d->data+q*d->nb[1]+h*d->nb[2]);
+        for(int64_t k=0;k<nk;++k){int64_t r=std::min<int64_t>(std::max<int64_t>(ix[k],0),nr-1);float mv=mask->type==GGML_TYPE_F16?GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t*)mr)[k]):((const float*)mr)[k];float bv=*(const float*)(tr+r*tab->nb[1]);out[k]=GGML_CPU_FP32_TO_FP16(mv+bv-sk);}}
+}
+void ggml_compute_forward_clip_norm(const ggml_compute_params*p,ggml_tensor*d){
+    const ggml_tensor*x=d->src[0],*s=d->src[1],*tau=d->src[2];const float t=ggml_get_op_params_f32(d,0);const int64_t n=x->ne[0],nr=x->ne[1],nt=x->ne[2];
+    for(int64_t z=p->ith;z<nr*nt;z+=p->nth){int64_t r=z%nr,k=z/nr;const float*xr=(const float*)((const char*)x->data+r*x->nb[1]+k*x->nb[2]);const float*sr=s?(const float*)((const char*)s->data+r*s->nb[1]):nullptr;float*dr=(float*)((char*)d->data+r*d->nb[1]+k*d->nb[2]);double ss=0;for(int64_t i=0;i<n;++i){float v=xr[i]*(sr?sr[i]:1.0f);ss+=(double)v*v;}float f=t/std::max(sqrtf((float)ss),t)*(tau?((const float*)tau->data)[k]:1.0f);for(int64_t i=0;i<n;++i)dr[i]=xr[i]*(sr?sr[i]:1.0f)*f;}
+}
+void ggml_compute_forward_conv_step(const ggml_compute_params*p,ggml_tensor*d){
+    const ggml_tensor*past=d->src[0],*x=d->src[1],*w=d->src[2],*dyn=d->src[3],*res=d->src[4],*cell=d->src[5];
+    const float scale=ggml_get_op_params_f32(d,0),xr=ggml_get_op_params_f32(d,1);const int64_t nc=w->ne[0],C=w->ne[1],hd=dyn?C/dyn->ne[1]:1;
+    for(int64_t c=p->ith;c<C;c+=p->nth){float v[8];const float*pr=(const float*)((const char*)past->data+c*past->nb[1]);for(int64_t k=0;k<nc-1;++k)v[k]=pr[k];v[nc-1]=((const float*)x->data)[c];const float*wr=(const float*)((const char*)w->data+c*w->nb[1]);const float*yr=dyn?(const float*)((const char*)dyn->data+(c/hd)*dyn->nb[1]):nullptr;float a=0;for(int64_t k=0;k<nc;++k)a+=(wr[k]+(yr?yr[nc-1-k]:0.0f))*v[k];float out=scale*(xr*v[nc-1]+a)+(res?((const float*)res->data)[c]:0.0f);((float*)d->data)[c]=out;float*cr=(float*)cell->data+c*(nc-1);for(int64_t k=0;k<nc-1;++k)cr[k]=v[k+1];}
+}
+void ggml_compute_forward_loop_down(const ggml_compute_params*p,ggml_tensor*d){
+    const ggml_tensor*x=d->src[0],*m=d->src[1],*w=d->src[2];const float eps=ggml_get_op_params_f32(d,0);const int64_t n=x->ne[0],r=w->ne[1],nt=x->ne[1];
+    for(int64_t z=p->ith;z<r*nt;z+=p->nth){int64_t j=z%r,t=z/r;const float*xr=(const float*)((const char*)x->data+t*x->nb[1]);const float*mr=(const float*)((const char*)m->data+t*m->nb[1]);const float*wr=(const float*)((const char*)w->data+j*w->nb[1]);double dx=0,dm=0,sx=0,sm=0;for(int64_t i=0;i<n;++i){dx+=(double)xr[i]*wr[i];dm+=(double)mr[i]*wr[n+i];sx+=(double)xr[i]*xr[i];sm+=(double)mr[i]*mr[i];}float ix=1.0f/sqrtf((float)(sx/n)+eps),im=1.0f/sqrtf((float)(sm/n)+eps);((float*)((char*)d->data+t*d->nb[1]))[j]=(float)dx*ix+(float)dm*im;}
+}
+void ggml_compute_forward_situ(const ggml_compute_params*p,ggml_tensor*d){
+    const ggml_tensor*g=d->src[0],*u=d->src[1];GGML_ASSERT(g->type==GGML_TYPE_F32&&u&&u->type==GGML_TYPE_F32&&d->type==GGML_TYPE_F32);
+    const int64_t n=d->ne[0],rows=ggml_nrows(d);const float beta=ggml_get_op_params_f32(d,2),lb=ggml_get_op_params_f32(d,3);
+    for(int64_t z=p->ith;z<rows;z+=p->nth){const float*gr=(const float*)((const char*)g->data+z*g->nb[1]);const float*ur=(const float*)((const char*)u->data+z*u->nb[1]);float*dr=(float*)((char*)d->data+z*d->nb[1]);for(int64_t i=0;i<n;++i){float a=gr[i],b=ur[i];float ga=beta*tanhf(a/beta)/(1.0f+expf(-a));float ub=lb>0.0f?lb*tanhf(b/lb):b;dr[i]=ga*ub;}}
 }

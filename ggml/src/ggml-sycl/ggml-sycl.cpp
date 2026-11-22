@@ -2531,19 +2531,6 @@ static void diag_mask_inf_f32(const float * x, float * dst, const int ncols, con
     dst[i] = x[i] - (col > n_past + row % rows_per_channel) * FLT_MAX;
 }
 
-static void scale_f32(const float * x, float * dst, const float scale, const float bias, const int k,
-                      const sycl::nd_item<3> &item_ct1) {
-    const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
-                  item_ct1.get_local_id(2);
-
-    if (i >= k) {
-        return;
-    }
-
-    dst[i] = scale * x[i] + bias;
-}
-
-
 static void ggml_mul_mat_p021_f16_f32_sycl(const void *vx, const float *y,
                                            float *dst, const int ncols_x,
                                            const int nrows_x,
@@ -2589,18 +2576,17 @@ static void ggml_mul_mat_vec_nc_f16_f32_sycl(
 
 
 
-static void scale_f32_sycl(const float *x, float *dst, const float scale, const float bias,
-                           const int k, queue_ptr stream) {
-    const int num_blocks = (k + SYCL_SCALE_BLOCK_SIZE - 1) / SYCL_SCALE_BLOCK_SIZE;
-    stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) *
-                              sycl::range<3>(1, 1, SYCL_SCALE_BLOCK_SIZE),
-                          sycl::range<3>(1, 1, SYCL_SCALE_BLOCK_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) {
-            scale_f32(x, dst, scale, bias, k, item_ct1);
-        });
+static void scale_f32_strided_sycl(const ggml_tensor * src, float * dst, float scale, float bias, queue_ptr stream) {
+    const int64_t n0=src->ne[0], n1=src->ne[1], n2=src->ne[2], n3=src->ne[3];
+    const int64_t total=n0*n1*n2*n3;
+    const size_t b0=src->nb[0], b1=src->nb[1], b2=src->nb[2], b3=src->nb[3];
+    const char * base=(const char *)src->data;
+    stream->parallel_for(sycl::range<1>((size_t)total), [=](sycl::id<1> id) {
+        int64_t i=id[0], i0=i%n0; i/=n0; int64_t i1=i%n1; i/=n1; int64_t i2=i%n2; i/=n2; int64_t i3=i;
+        const float v=*(const float *)(base+i0*b0+i1*b1+i2*b2+i3*b3);
+        dst[id[0]]=scale*v+bias;
+    });
 }
-
 
 static void sum_rows_f32_sycl(const float *x, float *dst, const int ncols,
                               const int nrows, queue_ptr stream) {
@@ -3414,8 +3400,7 @@ inline void ggml_sycl_op_sum(ggml_backend_sycl_context & ctx, ggml_tensor *dst) 
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
-    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
-    float *       dst_dd  = static_cast<float *>(dst->data);
+    float * dst_dd = static_cast<float *>(dst->data);
 
     const int64_t ne = ggml_nelements(dst->src[0]);
     // the kernel indexes in 32-bit
@@ -3429,8 +3414,7 @@ inline void ggml_sycl_op_sum_rows(ggml_backend_sycl_context & ctx, ggml_tensor *
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
-    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
-    float *       dst_dd  = static_cast<float *>(dst->data);
+    float * dst_dd = static_cast<float *>(dst->data);
 
     const int64_t ncols = dst->src[0]->ne[0];
     const int64_t nrows = ggml_nrows(dst->src[0]);
@@ -3447,8 +3431,7 @@ inline void ggml_sycl_op_mean(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
-    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
-    float *       dst_dd  = static_cast<float *>(dst->data);
+    float * dst_dd = static_cast<float *>(dst->data);
 
     const int64_t ncols = dst->src[0]->ne[0];
     const int64_t nrows = ggml_nrows(dst->src[0]);
@@ -3534,8 +3517,7 @@ inline void ggml_sycl_op_diag_mask_inf(ggml_backend_sycl_context & ctx, ggml_ten
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
-    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
-    float *       dst_dd  = static_cast<float *>(dst->data);
+    float * dst_dd = static_cast<float *>(dst->data);
 
     const int64_t ne00 = dst->src[0]->ne[0];
     const int64_t ne01 = dst->src[0]->ne[1];
@@ -3612,8 +3594,7 @@ inline void ggml_sycl_op_scale(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
-    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
-    float *       dst_dd  = static_cast<float *>(dst->data);
+    float * dst_dd = static_cast<float *>(dst->data);
 
     float scale;
     float bias;
@@ -3623,12 +3604,57 @@ inline void ggml_sycl_op_scale(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     // the kernel indexes in 32-bit
     GGML_ASSERT(ggml_nelements(dst->src[0]) <= INT32_MAX);
 
-    scale_f32_sycl(src0_dd, dst_dd, scale, bias, ggml_nelements(dst->src[0]), main_stream);
+    scale_f32_strided_sycl(dst->src[0], dst_dd, scale, bias, main_stream);
     /*
     DPCT1010:87: SYCL uses exceptions to report errors and does not use the
     error codes. The call was replaced with 0. You need to rewrite this code.
     */
     SYCL_CHECK(0);
+}
+
+// Inkling 2 fused operations. These kernels keep the model's small graph fragments on SYCL.
+static void ggml_sycl_inkling_depth_mix(ggml_backend_sycl_context & ctx, ggml_tensor * d) {
+    const ggml_tensor *q=d->src[0],*cur=d->src[1],*blocks=d->src[2];
+    const float eps=ggml_get_op_params_f32(d,0),scale=ggml_get_op_params_f32(d,1);
+    const int64_t ne=q->ne[0],nq=q->ne[1],nt=cur->ne[1],k=blocks?blocks->ne[1]:0,ns=k+1;
+    const float *qp=(const float*)q->data,*cp=(const float*)cur->data,*bp=blocks?(const float*)blocks->data:nullptr;float *out=(float*)d->data;
+    const size_t q1=q->nb[1]/sizeof(float),c1=cur->nb[1]/sizeof(float),b1=blocks?blocks->nb[1]/sizeof(float):0,b2=blocks?blocks->nb[2]/sizeof(float):0;
+    ctx.stream()->parallel_for(sycl::range<1>((size_t)(nq*nt)),[=](sycl::id<1> id){
+        int64_t z=id[0],qi=z%nq,t=z/nq;const float*qv=qp+qi*q1;float inv[8],sc[8],mx=-INFINITY;const float*xs[8];
+        for(int64_t a=0;a<ns;++a){xs[a]=a<k?bp+a*b1+t*b2:cp+t*c1;float ss=0,dot=0;for(int64_t e=0;e<ne;++e){float v=xs[a][e];ss+=v*v;dot+=v*qv[e];}inv[a]=sycl::rsqrt(ss/(float)ne+eps);sc[a]=scale*inv[a]*dot;mx=sycl::fmax(mx,sc[a]);}
+        float sum=0;for(int64_t a=0;a<ns;++a){sc[a]=sycl::exp(sc[a]-mx);sum+=sc[a];}for(int64_t a=0;a<ns;++a)sc[a]=sc[a]/sum*inv[a];
+        float*dst=out+qi*d->nb[1]/sizeof(float)+t*d->nb[2]/sizeof(float);for(int64_t e=0;e<ne;++e){float v=0;for(int64_t a=0;a<ns;++a)v+=sc[a]*xs[a][e];dst[e]=v;}
+    });
+}
+static void ggml_sycl_inkling_loop_gate(ggml_backend_sycl_context &ctx,ggml_tensor*d){
+    const ggml_tensor*h=d->src[0],*g=d->src[1],*f=d->src[2],*c=d->src[3],*m=d->src[4];const int64_t r=h->ne[0],nt=h->ne[1],n=g->ne[1];
+    const float*hp=(const float*)h->data,*gp=(const float*)g->data,*fp=(const float*)f->data,*cp=(const float*)c->data,*mp=(const float*)m->data;float*op=(float*)d->data;
+    const size_t h1=h->nb[1]/4,g1=g->nb[1]/4,f1=f->nb[1]/4,c1=c->nb[1]/4,m1=m->nb[1]/4,d1=d->nb[1]/4;
+    ctx.stream()->parallel_for(sycl::range<1>((size_t)(n*nt)),[=](sycl::id<1> id){int64_t z=id[0],i=z%n,t=z/n;float a=0,b=0;for(int64_t j=0;j<r;++j){float hv=hp[t*h1+j];a+=gp[i*g1+j]*hv;b+=fp[i*f1+j]*hv;}float ga=sycl::tanh(a),fb=sycl::tanh(b);op[t*d1+i]=(1.0f-fb)*cp[t*c1+i]+ga*mp[t*m1+i];});
+}
+static void ggml_sycl_inkling_rel_mask(ggml_backend_sycl_context &ctx,ggml_tensor*d){
+    const ggml_tensor*tab=d->src[0],*idx=d->src[1],*mask=d->src[2],*sink=d->src[3];const int h0=ggml_get_op_params_i32(d,0);const int64_t nk=idx->ne[0],nq=idx->ne[1],nh=d->ne[2],nr=tab->ne[1];
+    const char*tp=(const char*)tab->data;const int32_t*ip=(const int32_t*)idx->data;const char*mp=(const char*)mask->data;const float*sp=sink?(const float*)sink->data:nullptr;sycl::half*op=(sycl::half*)d->data;
+    const size_t t0=tab->nb[0],t1=tab->nb[1],t2=tab->nb[2],i1=idx->nb[1],m1=mask->nb[1],s1=sink?sink->nb[1]:0,o1=d->nb[1],o2=d->nb[2];const bool mf16=mask->type==GGML_TYPE_F16;
+    ctx.stream()->parallel_for(sycl::range<1>((size_t)(nk*nq*nh)),[=](sycl::id<1> id){int64_t z=id[0],k=z%nk;z/=nk;int64_t q=z%nq,h=z/nq;int32_t ri=ip[q*i1/4+k];ri=sycl::clamp(ri,0,(int32_t)(nr-1));float mv=mf16?(float)((const sycl::half*)(mp+q*m1))[k]:((const float*)(mp+q*m1))[k];float bv=*(const float*)(tp+(h0+h)*t0+q*t2+ri*t1);float sv=sp?*(const float*)((const char*)sp+(h0+h)*4+q*s1):0.0f;op[(q*o1+h*o2)/2+k]=(sycl::half)(mv+bv-sv);});
+}
+static void ggml_sycl_inkling_clip_norm(ggml_backend_sycl_context &ctx,ggml_tensor*d){
+    const ggml_tensor*x=d->src[0],*s=d->src[1],*tau=d->src[2];const float t=ggml_get_op_params_f32(d,0);const int64_t n=x->ne[0],nr=x->ne[1],nt=x->ne[2];const float*xp=(const float*)x->data,*sp=s?(const float*)s->data:nullptr,*tp=tau?(const float*)tau->data:nullptr;float*op=(float*)d->data;
+    const size_t x1=x->nb[1]/4,x2=x->nb[2]/4,s1=s?s->nb[1]/4:0,d1=d->nb[1]/4,d2=d->nb[2]/4;
+    ctx.stream()->parallel_for(sycl::range<1>((size_t)(nr*nt)),[=](sycl::id<1> id){int64_t z=id[0],r=z%nr,k=z/nr;const float*xr=xp+r*x1+k*x2,*sr=sp?sp+r*s1:nullptr;float ss=0;for(int64_t i=0;i<n;++i){float v=xr[i]*(sr?sr[i]:1.0f);ss+=v*v;}float f=t/sycl::fmax(sycl::sqrt(ss),t)*(tp?tp[k]:1.0f);float*dr=op+r*d1+k*d2;for(int64_t i=0;i<n;++i)dr[i]=xr[i]*(sr?sr[i]:1.0f)*f;});
+}
+static void ggml_sycl_inkling_conv_step(ggml_backend_sycl_context &ctx,ggml_tensor*d){
+    const ggml_tensor*past=d->src[0],*x=d->src[1],*w=d->src[2],*dyn=d->src[3],*res=d->src[4],*cell=d->src[5];const float scale=ggml_get_op_params_f32(d,0),xr=ggml_get_op_params_f32(d,1);const int64_t nc=w->ne[0],C=w->ne[1],hd=dyn?C/dyn->ne[1]:1;
+    const float*pp=(const float*)past->data,*xp=(const float*)x->data,*wp=(const float*)w->data,*dp=dyn?(const float*)dyn->data:nullptr,*rp=res?(const float*)res->data:nullptr;float*op=(float*)d->data,*cp=(float*)cell->data;const size_t p1=past->nb[1]/4,w1=w->nb[1]/4,d1=dyn?dyn->nb[1]/4:0;
+    ctx.stream()->parallel_for(sycl::range<1>((size_t)C),[=](sycl::id<1> id){int64_t c=id[0];float v[8];const float*pr=pp+c*p1;for(int64_t k=0;k<nc-1;++k)v[k]=pr[k];v[nc-1]=xp[c];const float*wr=wp+c*w1,*yr=dp?dp+(c/hd)*d1:nullptr;float acc=0;for(int64_t k=0;k<nc;++k)acc+=(wr[k]+(yr?yr[nc-1-k]:0.0f))*v[k];op[c]=scale*(xr*v[nc-1]+acc)+(rp?rp[c]:0.0f);float*cr=cp+c*(nc-1);for(int64_t k=0;k<nc-1;++k)cr[k]=v[k+1];});
+}
+static void ggml_sycl_inkling_loop_down(ggml_backend_sycl_context &ctx,ggml_tensor*d){
+    const ggml_tensor*x=d->src[0],*m=d->src[1],*w=d->src[2];const float eps=ggml_get_op_params_f32(d,0);const int64_t n=x->ne[0],r=w->ne[1],nt=x->ne[1];const float*xp=(const float*)x->data,*mp=(const float*)m->data,*wp=(const float*)w->data;float*op=(float*)d->data;const size_t x1=x->nb[1]/4,m1=m->nb[1]/4,w1=w->nb[1]/4,d1=d->nb[1]/4;
+    ctx.stream()->parallel_for(sycl::range<1>((size_t)(r*nt)),[=](sycl::id<1> id){int64_t z=id[0],j=z%r,t=z/r;const float*xr=xp+t*x1,*mr=mp+t*m1,*wr=wp+j*w1;float dx=0,dm=0,sx=0,sm=0;for(int64_t i=0;i<n;++i){dx+=xr[i]*wr[i];dm+=mr[i]*wr[n+i];sx+=xr[i]*xr[i];sm+=mr[i]*mr[i];}op[t*d1+j]=dx*sycl::rsqrt(sx/n+eps)+dm*sycl::rsqrt(sm/n+eps);});
+}
+static void ggml_sycl_inkling_situ(ggml_backend_sycl_context &ctx,ggml_tensor*d){
+    const ggml_tensor*g=d->src[0],*u=d->src[1];const float beta=ggml_get_op_params_f32(d,2),lb=ggml_get_op_params_f32(d,3);const int64_t n=d->ne[0],rows=ggml_nrows(d);const float*gp=(const float*)g->data,*up=(const float*)u->data;float*op=(float*)d->data;const size_t g1=g->nb[1]/4,u1=u->nb[1]/4,d1=d->nb[1]/4;
+    ctx.stream()->parallel_for(sycl::range<1>((size_t)(n*rows)),[=](sycl::id<1> id){int64_t z=id[0],i=z%n,r=z/n;float a=gp[r*g1+i],b=up[r*u1+i];float ga=beta*sycl::tanh(a/beta)/(1.0f+sycl::exp(-a));float ub=lb>0.0f?lb*sycl::tanh(b/lb):b;op[r*d1+i]=ga*ub;});
 }
 
 static void ggml_sycl_set_peer_access(const int n_tokens, [[maybe_unused]] int main_device) {
@@ -6344,6 +6370,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
                 case GGML_GLU_OP_SWIGLU_CLAMP:
                     ggml_sycl_swiglu_clamp(ctx, dst);
                     break;
+                case GGML_GLU_OP_SITU:
+                    ggml_sycl_inkling_situ(ctx, dst);
+                    break;
                 case GGML_GLU_OP_GEGLU_ERF:
                     ggml_sycl_geglu_erf(ctx, dst);
                     break;
@@ -6354,6 +6383,12 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
                     return false;
             }
             break;
+        case GGML_OP_DEPTH_MIX: ggml_sycl_inkling_depth_mix(ctx, dst); break;
+        case GGML_OP_LOOP_GATE: ggml_sycl_inkling_loop_gate(ctx, dst); break;
+        case GGML_OP_REL_MASK: ggml_sycl_inkling_rel_mask(ctx, dst); break;
+        case GGML_OP_CLIP_NORM: ggml_sycl_inkling_clip_norm(ctx, dst); break;
+        case GGML_OP_CONV_STEP: ggml_sycl_inkling_conv_step(ctx, dst); break;
+        case GGML_OP_LOOP_DOWN: ggml_sycl_inkling_loop_down(ctx, dst); break;
         case GGML_OP_NORM:
             ggml_sycl_norm(ctx, dst);
             break;
@@ -7364,12 +7399,24 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
-                    // the fused GLU kernels only have f32/f16 instantiations
-                    return ggml_is_contiguous_1(op->src[0]) &&
-                           (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+                    return ggml_is_contiguous_1(op->src[0]) && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+                case GGML_GLU_OP_SITU:
+                    return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1] && op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous_1(op->src[0]) && ggml_is_contiguous_1(op->src[1]);
                 default:
                     return false;
             }
+        case GGML_OP_DEPTH_MIX:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && (!op->src[2] || op->src[2]->type == GGML_TYPE_F32);
+        case GGML_OP_LOOP_GATE:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 && op->src[4]->type == GGML_TYPE_F32 && op->src[0]->ne[0] <= 256;
+        case GGML_OP_REL_MASK:
+            return op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 && (op->src[2]->type == GGML_TYPE_F16 || op->src[2]->type == GGML_TYPE_F32);
+        case GGML_OP_CLIP_NORM:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && (!op->src[1] || op->src[1]->type == GGML_TYPE_F32) && (!op->src[2] || op->src[2]->type == GGML_TYPE_F32);
+        case GGML_OP_CONV_STEP:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 && op->src[2]->ne[0] <= 8;
+        case GGML_OP_LOOP_DOWN:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
@@ -7627,8 +7674,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_RMS_NORM_BACK:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SCALE:
-            // the scale kernel is f32 only, and reads src0 flat
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONT:
             return true;
         case GGML_OP_TRI:

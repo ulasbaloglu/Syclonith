@@ -2306,9 +2306,13 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_lightning_indexer(params, tensor);
             } break;
         case GGML_OP_QSA_SELECT:
-            {
-                ggml_compute_forward_qsa_select(params, tensor);
-            } break;
+            { ggml_compute_forward_qsa_select(params, tensor); } break;
+        case GGML_OP_DEPTH_MIX: { ggml_compute_forward_depth_mix(params, tensor); } break;
+        case GGML_OP_LOOP_GATE: { ggml_compute_forward_loop_gate(params, tensor); } break;
+        case GGML_OP_REL_MASK: { ggml_compute_forward_rel_mask(params, tensor); } break;
+        case GGML_OP_CLIP_NORM: { ggml_compute_forward_clip_norm(params, tensor); } break;
+        case GGML_OP_CONV_STEP: { ggml_compute_forward_conv_step(params, tensor); } break;
+        case GGML_OP_LOOP_DOWN: { ggml_compute_forward_loop_down(params, tensor); } break;
         case GGML_OP_DSV4_HC_COMB:
             {
                 ggml_compute_forward_dsv4_hc_comb(params, tensor);
@@ -2557,6 +2561,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
+                case GGML_GLU_OP_SITU:
                     {
                         n_tasks = n_threads;
                     } break;
@@ -2650,9 +2655,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_QSA_SELECT:
-            {
-                n_tasks = 1;
-            } break;
+            { n_tasks = 1; } break;
+        case GGML_OP_DEPTH_MIX:
+        case GGML_OP_LOOP_GATE:
+        case GGML_OP_REL_MASK:
+        case GGML_OP_CLIP_NORM:
+        case GGML_OP_CONV_STEP:
+        case GGML_OP_LOOP_DOWN:
+            { n_tasks = n_threads; } break;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_RWKV_WKV7:
