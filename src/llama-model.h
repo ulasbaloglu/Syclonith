@@ -602,6 +602,24 @@ struct llama_layer {
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
 
+    // inkling2
+    struct ggml_tensor * attn_rel         = nullptr;
+    struct ggml_tensor * attn_rel_bias    = nullptr;
+    struct ggml_tensor * attn_q_clip      = nullptr;
+    struct ggml_tensor * attn_rel_clip    = nullptr;
+    struct ggml_tensor * attn_sink_proj   = nullptr;
+    struct ggml_tensor * attn_q_inp_norm  = nullptr;
+    struct ggml_tensor * attn_k_inp_norm  = nullptr;
+    struct ggml_tensor * attn_v_inp_norm  = nullptr;
+    struct ggml_tensor * attn_k_conv      = nullptr;
+    struct ggml_tensor * attn_v_conv      = nullptr;
+    struct ggml_tensor * attn_k_conv_proj = nullptr;
+    struct ggml_tensor * attn_v_conv_proj = nullptr;
+    struct ggml_tensor * attn_post_conv   = nullptr;
+    struct ggml_tensor * attn_res_query   = nullptr;
+    struct ggml_tensor * ffn_post_conv    = nullptr;
+    struct ggml_tensor * ffn_res_query    = nullptr;
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;
@@ -662,6 +680,7 @@ struct llama_model {
 
     struct ggml_tensor * output_norm     = nullptr;
     struct ggml_tensor * output_res_score = nullptr; // kimi-k3: final cross-layer residual mix
+    struct ggml_tensor * output_res_query = nullptr; // inkling2: query of the final attention-residual mix
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;

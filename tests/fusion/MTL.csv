@@ -154,6 +154,9 @@ llada-moe           ,1   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS   ,      2
 llama               ,0   ,any     ,RMS_NORM+MUL                ,      5
 llama               ,0   ,any     ,MUL+ADD                     ,      4
 llama               ,0   ,any     ,RMS_NORM+MUL                ,      5
+inkling2            ,0   ,any     ,MUL+ADD                     ,      6
+inkling2            ,0   ,any     ,RMS_NORM+MUL                ,     10
+inkling2            ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS+SUM_ROWS+SCALE+DIV+SCALE,      3
 llama               ,0   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
 llama4              ,0   ,any     ,ADD+ADD                     ,      2
 llama4              ,0   ,any     ,RMS_NORM+MUL                ,      9

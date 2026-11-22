@@ -1055,6 +1055,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_muse_glimmer>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_INKLING2V:
+            {
+                builder = std::make_unique<clip_graph_inkling2v>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_STEP3VL:
             {
                 builder = std::make_unique<clip_graph_step3vl>(ctx, img);
@@ -2384,6 +2388,7 @@ struct clip_model_loader {
         };
 
         model.class_embedding = get_tensor(TN_CLASS_EMBD, false);
+        model.class_position_embedding = get_tensor(TN_CLASS_POS_EMBD, false);
 
         model.pre_ln_w = get_tensor(string_format(TN_LN_PRE, prefix, "weight"), false);
         model.pre_ln_b = get_tensor(string_format(TN_LN_PRE, prefix, "bias"),   false);

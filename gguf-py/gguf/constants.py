@@ -107,6 +107,7 @@ class Keys:
 
     class LLM:
         VOCAB_SIZE                        = "{arch}.vocab_size"
+        VOCAB_SIZE_UNPADDED               = "{arch}.vocab_size_unpadded"
         CONTEXT_LENGTH                    = "{arch}.context_length"
         EMBEDDING_LENGTH                  = "{arch}.embedding_length"
         EMBEDDING_LENGTH_OUT              = "{arch}.embedding_length_out"
@@ -234,6 +235,12 @@ class Keys:
             TYPES      = "{arch}.attention.indexer.types"
             KPOOL             = "{arch}.attention.indexer.kpool"              # GLM5-Next
             KPOOL_SELECT_TAIL = "{arch}.attention.indexer.kpool_select_tail"  # GLM5-Next
+        RELATIVE_LENGTH              = "{arch}.attention.relative_length"
+        RELATIVE_EXTENT              = "{arch}.attention.relative_extent"
+        QK_CLIP                      = "{arch}.attention.qk_clip"
+        RELATIVE_CLIP                = "{arch}.attention.relative_clip"
+        LOG_SCALE_FLOOR              = "{arch}.attention.log_scale_floor"
+        LOG_SCALE_ALPHA              = "{arch}.attention.log_scale_alpha"
 
     class HyperConnection:
         COUNT                = "{arch}.hyper_connection.count"
@@ -317,6 +324,13 @@ class Keys:
     class ConvNext:
         EMBEDDING_LENGTH = "{arch}.convnext.embedding_length"
         BLOCK_COUNT      = "{arch}.convnext.block_count"
+
+    class Loop:
+        START     = "{arch}.loop.start"
+        END       = "{arch}.loop.end"
+        COUNT     = "{arch}.loop.count"
+        GATE_RANK = "{arch}.loop.gate_rank"
+        VARYING   = "{arch}.loop.varying"
 
     class Classifier:
         OUTPUT_LABELS = "{arch}.classifier.output_labels"
@@ -675,6 +689,8 @@ class MODEL_ARCH(IntEnum):
     QWEN3TTS         = auto()
     POCKETTTS        = auto()
     K2HORIZON        = auto()
+    INKLING2         = auto()
+    INKLING2_LOOP    = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -789,6 +805,7 @@ class MODEL_TENSOR(IntEnum):
     SSM_CONV1D_Q         = auto() # Kimi Linear
     SSM_CONV1D_K         = auto() # Kimi Linear
     SSM_CONV1D_V         = auto() # Kimi Linear
+    OUTPUT_RES_QUERY     = auto()
     SSM_F_A              = auto() # Kimi Linear
     SSM_F_B              = auto() # Kimi Linear
     SSM_BETA             = auto() # Kimi Linear qwen3.5
@@ -813,6 +830,20 @@ class MODEL_TENSOR(IntEnum):
     TIME_MIX_G1          = auto()
     TIME_MIX_G2          = auto()
     TIME_MIX_K_K         = auto()
+    ATTN_REL             = auto()
+    ATTN_REL_BIAS        = auto()
+    ATTN_Q_CLIP          = auto()
+    ATTN_REL_CLIP        = auto()
+    ATTN_SINK_PROJ       = auto()
+    ATTN_Q_INP_NORM      = auto()
+    ATTN_K_INP_NORM      = auto()
+    ATTN_V_INP_NORM      = auto()
+    ATTN_K_CONV          = auto()
+    ATTN_V_CONV          = auto()
+    ATTN_K_CONV_PROJ     = auto()
+    ATTN_V_CONV_PROJ     = auto()
+    ATTN_POST_CONV       = auto()
+    ATTN_RES_QUERY       = auto()
     TIME_MIX_K_A         = auto()
     TIME_MIX_R_K         = auto()
     TIME_MIX_LERP_X      = auto()
@@ -836,6 +867,19 @@ class MODEL_TENSOR(IntEnum):
     CHANNEL_MIX_LERP_R   = auto()
     CHANNEL_MIX_KEY      = auto()
     CHANNEL_MIX_RECEPTANCE = auto()
+    LOOP_MSG_QUERY       = auto()
+    LOOP_Q_CTRL_DOWN     = auto()
+    LOOP_Q_CTRL_GAIN     = auto()
+    LOOP_Q_CTRL_FORGET   = auto()
+    LOOP_K_CTRL_DOWN     = auto()
+    LOOP_K_CTRL_GAIN     = auto()
+    LOOP_K_CTRL_FORGET   = auto()
+    LOOP_V_CTRL_DOWN     = auto()
+    LOOP_V_CTRL_GAIN     = auto()
+    LOOP_V_CTRL_FORGET   = auto()
+    LOOP_FFN_CTRL_DOWN   = auto()
+    LOOP_FFN_CTRL_GAIN   = auto()
+    LOOP_FFN_CTRL_FORGET = auto()
     CHANNEL_MIX_VALUE    = auto()
     ATTN_Q_A             = auto()
     ATTN_Q_B             = auto()
@@ -843,6 +887,8 @@ class MODEL_TENSOR(IntEnum):
     ATTN_KV_B            = auto()
     ATTN_K_B             = auto()
     ATTN_V_B             = auto()
+    FFN_POST_CONV        = auto()
+    FFN_RES_QUERY        = auto()
     ATTN_Q_A_NORM        = auto()
     ATTN_KV_A_NORM       = auto()
     ATTN_KV              = auto()
@@ -968,6 +1014,7 @@ class MODEL_TENSOR(IntEnum):
     V_ENC_EMBD_PATCH     = auto()
     V_ENC_EMBD_NORM      = auto()
     V_ENC_EMBD_PATCH_NORM = auto() # allow multiple norms in the same embd, e.g. for gemma4u
+    V_ENC_EMBD_CLS_POS   = auto()
     V_ENC_EMBD_POS       = auto()
     V_ENC_INPUT_NORM     = auto()
     V_ENC_ATTN_QKV       = auto()
@@ -1576,6 +1623,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SSM_CONV1D_K:              "blk.{bid}.ssm_conv1d_k",         # Kimi Linear
     MODEL_TENSOR.SSM_CONV1D_V:              "blk.{bid}.ssm_conv1d_v",         # Kimi Linear
     MODEL_TENSOR.SSM_F_A:                   "blk.{bid}.ssm_f_a",              # Kimi Linear
+    MODEL_ARCH.INKLING2:         "inkling2",
     MODEL_TENSOR.SSM_F_B:                   "blk.{bid}.ssm_f_b",              # Kimi Linear
     MODEL_TENSOR.SSM_BETA:                  "blk.{bid}.ssm_beta",             # Kimi Linear qwen3.5
     MODEL_TENSOR.SSM_G_A:                   "blk.{bid}.ssm_g_a",              # Kimi Linear
@@ -1618,6 +1666,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.TIME_MIX_GATE:             "blk.{bid}.time_mix_gate",
     MODEL_TENSOR.TIME_MIX_LN:               "blk.{bid}.time_mix_ln",
     MODEL_TENSOR.TIME_MIX_OUTPUT:           "blk.{bid}.time_mix_output",
+    MODEL_TENSOR.OUTPUT_RES_QUERY:          "output_res_query",
     MODEL_TENSOR.CHANNEL_MIX_LERP_K:        "blk.{bid}.channel_mix_lerp_k",
     MODEL_TENSOR.CHANNEL_MIX_LERP_R:        "blk.{bid}.channel_mix_lerp_r",
     MODEL_TENSOR.CHANNEL_MIX_KEY:           "blk.{bid}.channel_mix_key",
@@ -1643,6 +1692,20 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.HC_FFN_SCALE:              "blk.{bid}.hc_ffn_scale",
     MODEL_TENSOR.HC_ATTN_NORM:              "blk.{bid}.hc_attn_norm",         # qwen4exp
     MODEL_TENSOR.HC_ATTN_DOWN:              "blk.{bid}.hc_attn_down",         # qwen4exp
+    MODEL_TENSOR.ATTN_REL:                  "blk.{bid}.attn_rel",
+    MODEL_TENSOR.ATTN_REL_BIAS:             "blk.{bid}.attn_rel_bias",
+    MODEL_TENSOR.ATTN_Q_CLIP:               "blk.{bid}.attn_q_clip",
+    MODEL_TENSOR.ATTN_REL_CLIP:             "blk.{bid}.attn_rel_clip",
+    MODEL_TENSOR.ATTN_SINK_PROJ:            "blk.{bid}.attn_sink_proj",
+    MODEL_TENSOR.ATTN_Q_INP_NORM:           "blk.{bid}.attn_q_inp_norm",
+    MODEL_TENSOR.ATTN_K_INP_NORM:           "blk.{bid}.attn_k_inp_norm",
+    MODEL_TENSOR.ATTN_V_INP_NORM:           "blk.{bid}.attn_v_inp_norm",
+    MODEL_TENSOR.ATTN_K_CONV:               "blk.{bid}.attn_k_conv",
+    MODEL_TENSOR.ATTN_V_CONV:               "blk.{bid}.attn_v_conv",
+    MODEL_TENSOR.ATTN_K_CONV_PROJ:          "blk.{bid}.attn_k_conv_proj",
+    MODEL_TENSOR.ATTN_V_CONV_PROJ:          "blk.{bid}.attn_v_conv_proj",
+    MODEL_TENSOR.ATTN_POST_CONV:            "blk.{bid}.attn_post_conv",
+    MODEL_TENSOR.ATTN_RES_QUERY:            "blk.{bid}.attn_res_query",
     MODEL_TENSOR.HC_ATTN_UP:                "blk.{bid}.hc_attn_up",           # qwen4exp
     MODEL_TENSOR.HC_ATTN_INJECT:            "blk.{bid}.hc_attn_inject",       # qwen4exp
     MODEL_TENSOR.HC_FFN_NORM:               "blk.{bid}.hc_ffn_norm",          # qwen4exp
@@ -1677,6 +1740,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DEC_FFN_NORM:              "dec.blk.{bid}.ffn_norm",
     MODEL_TENSOR.DEC_FFN_GATE:              "dec.blk.{bid}.ffn_gate",
     MODEL_TENSOR.DEC_FFN_DOWN:              "dec.blk.{bid}.ffn_down",
+    MODEL_TENSOR.FFN_POST_CONV:             "blk.{bid}.ffn_post_conv",
+    MODEL_TENSOR.FFN_RES_QUERY:             "blk.{bid}.ffn_res_query",
     MODEL_TENSOR.DEC_FFN_UP:                "dec.blk.{bid}.ffn_up",
     MODEL_TENSOR.DEC_OUTPUT_NORM:           "dec.output_norm",
     MODEL_TENSOR.ENC_ATTN_NORM:             "enc.blk.{bid}.attn_norm",
@@ -1684,6 +1749,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ENC_ATTN_K:                "enc.blk.{bid}.attn_k",
     MODEL_TENSOR.ENC_ATTN_V:                "enc.blk.{bid}.attn_v",
     MODEL_TENSOR.ENC_ATTN_OUT:              "enc.blk.{bid}.attn_o",
+    MODEL_ARCH.INKLING2_LOOP:    "inkling2_loop",
     MODEL_TENSOR.ENC_ATTN_REL_B:            "enc.blk.{bid}.attn_rel_b",
     MODEL_TENSOR.ENC_FFN_NORM:              "enc.blk.{bid}.ffn_norm",
     MODEL_TENSOR.ENC_FFN_GATE:              "enc.blk.{bid}.ffn_gate",
@@ -1752,6 +1818,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_ENC_EMBD_PATCH:          "v.patch_embd",
     MODEL_TENSOR.V_ENC_EMBD_NORM:           "v.norm_embd",
     MODEL_TENSOR.V_ENC_EMBD_PATCH_NORM:     "v.patch_norm.{bid}",
+    MODEL_TENSOR.V_ENC_EMBD_CLS_POS:        "v.class_position_embd",
     MODEL_TENSOR.V_ENC_EMBD_POS:            "v.position_embd",
     MODEL_TENSOR.V_ENC_ATTN_QKV:            "v.blk.{bid}.attn_qkv",
     MODEL_TENSOR.V_ENC_ATTN_Q:              "v.blk.{bid}.attn_q",
@@ -1784,6 +1851,19 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_MM_INP_NORM:             "mm.input_norm",
     MODEL_TENSOR.V_MM_SOFT_EMB_NORM:        "mm.soft_emb_norm",         # gemma3n
     MODEL_TENSOR.V_MM_EMBEDDING:            "mm.embedding",             # gemma3n
+    MODEL_TENSOR.LOOP_MSG_QUERY:            "blk.{bid}.loop_msg_query",
+    MODEL_TENSOR.LOOP_Q_CTRL_DOWN:          "blk.{bid}.loop_q_ctrl_down",
+    MODEL_TENSOR.LOOP_Q_CTRL_GAIN:          "blk.{bid}.loop_q_ctrl_gain",
+    MODEL_TENSOR.LOOP_Q_CTRL_FORGET:        "blk.{bid}.loop_q_ctrl_forget",
+    MODEL_TENSOR.LOOP_K_CTRL_DOWN:          "blk.{bid}.loop_k_ctrl_down",
+    MODEL_TENSOR.LOOP_K_CTRL_GAIN:          "blk.{bid}.loop_k_ctrl_gain",
+    MODEL_TENSOR.LOOP_K_CTRL_FORGET:        "blk.{bid}.loop_k_ctrl_forget",
+    MODEL_TENSOR.LOOP_V_CTRL_DOWN:          "blk.{bid}.loop_v_ctrl_down",
+    MODEL_TENSOR.LOOP_V_CTRL_GAIN:          "blk.{bid}.loop_v_ctrl_gain",
+    MODEL_TENSOR.LOOP_V_CTRL_FORGET:        "blk.{bid}.loop_v_ctrl_forget",
+    MODEL_TENSOR.LOOP_FFN_CTRL_DOWN:        "blk.{bid}.loop_ffn_ctrl_down",
+    MODEL_TENSOR.LOOP_FFN_CTRL_GAIN:        "blk.{bid}.loop_ffn_ctrl_gain",
+    MODEL_TENSOR.LOOP_FFN_CTRL_FORGET:      "blk.{bid}.loop_ffn_ctrl_forget",
     MODEL_TENSOR.V_MM_HARD_EMB_NORM:        "mm.hard_emb_norm",         # gemma3n
     MODEL_TENSOR.V_ENC_CONV_STEM:           "v.conv_stem.conv",         # gemma3n
     MODEL_TENSOR.V_ENC_CONV_STEM_NORM:      "v.conv_stem.bn",           # gemma3n
@@ -2093,6 +2173,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.V_ENC_EMBD_PATCH,
         MODEL_TENSOR.V_ENC_EMBD_NORM,
         MODEL_TENSOR.V_ENC_EMBD_PATCH_NORM,
+        MODEL_TENSOR.V_ENC_EMBD_CLS_POS,
         MODEL_TENSOR.V_ENC_EMBD_POS,
         MODEL_TENSOR.V_ENC_EMBD_IMGNL,
         MODEL_TENSOR.V_ENC_EMBD_VSEP,
@@ -5990,6 +6071,91 @@ MODEL_TENSOR_SKIP: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ROPE_FREQS,
         MODEL_TENSOR.ATTN_ROT_EMBD,
     ],
+    MODEL_ARCH.INKLING2: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT_RES_QUERY,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_REL,
+        MODEL_TENSOR.ATTN_REL_BIAS,
+        MODEL_TENSOR.ATTN_Q_CLIP,
+        MODEL_TENSOR.ATTN_REL_CLIP,
+        MODEL_TENSOR.ATTN_SINK_PROJ,
+        MODEL_TENSOR.ATTN_Q_INP_NORM,
+        MODEL_TENSOR.ATTN_K_INP_NORM,
+        MODEL_TENSOR.ATTN_V_INP_NORM,
+        MODEL_TENSOR.ATTN_K_CONV,
+        MODEL_TENSOR.ATTN_V_CONV,
+        MODEL_TENSOR.ATTN_K_CONV_PROJ,
+        MODEL_TENSOR.ATTN_V_CONV_PROJ,
+        MODEL_TENSOR.ATTN_POST_CONV,
+        MODEL_TENSOR.ATTN_RES_QUERY,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_UP_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_POST_CONV,
+        MODEL_TENSOR.FFN_RES_QUERY,
+    ],
+    MODEL_ARCH.INKLING2_LOOP: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT_RES_QUERY,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_REL,
+        MODEL_TENSOR.ATTN_REL_BIAS,
+        MODEL_TENSOR.ATTN_Q_CLIP,
+        MODEL_TENSOR.ATTN_REL_CLIP,
+        MODEL_TENSOR.ATTN_SINK_PROJ,
+        MODEL_TENSOR.ATTN_Q_INP_NORM,
+        MODEL_TENSOR.ATTN_K_INP_NORM,
+        MODEL_TENSOR.ATTN_V_INP_NORM,
+        MODEL_TENSOR.ATTN_K_CONV,
+        MODEL_TENSOR.ATTN_V_CONV,
+        MODEL_TENSOR.ATTN_K_CONV_PROJ,
+        MODEL_TENSOR.ATTN_V_CONV_PROJ,
+        MODEL_TENSOR.ATTN_POST_CONV,
+        MODEL_TENSOR.ATTN_RES_QUERY,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_UP_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_POST_CONV,
+        MODEL_TENSOR.FFN_RES_QUERY,
+        MODEL_TENSOR.LOOP_MSG_QUERY,
+        MODEL_TENSOR.LOOP_Q_CTRL_DOWN,
+        MODEL_TENSOR.LOOP_Q_CTRL_GAIN,
+        MODEL_TENSOR.LOOP_Q_CTRL_FORGET,
+        MODEL_TENSOR.LOOP_K_CTRL_DOWN,
+        MODEL_TENSOR.LOOP_K_CTRL_GAIN,
+        MODEL_TENSOR.LOOP_K_CTRL_FORGET,
+        MODEL_TENSOR.LOOP_V_CTRL_DOWN,
+        MODEL_TENSOR.LOOP_V_CTRL_GAIN,
+        MODEL_TENSOR.LOOP_V_CTRL_FORGET,
+        MODEL_TENSOR.LOOP_FFN_CTRL_DOWN,
+        MODEL_TENSOR.LOOP_FFN_CTRL_GAIN,
+        MODEL_TENSOR.LOOP_FFN_CTRL_FORGET,
+    ],
 }
 
 #
@@ -6233,6 +6399,7 @@ class VisionProjectorType:
     MIMOVL         = "mimovl"
     MIMO_AUDIO     = "mimo_audio"
     GRANITE4_VISION = "granite4_vision"
+    INKLING2V      = "inkling2v"
     MUSE_GLIMMER   = "muse-glimmer"
     COHERE2V       = "cohere2v"
     D1OMNI_V       = "d1omni_v"  # lfm2 vision, without separator tokens

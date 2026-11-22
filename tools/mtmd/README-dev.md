@@ -37,6 +37,7 @@ We provide a set of helper functions via `mtmd_helper` to make using libmtmd eas
 
 ## Audio generation support
 
+- Models having both audio and vision encoders must have different arch names (projector types), postfixed by `a` and `v`. See Gemma 4 as an example (`gemma4a` / `gemma4v`)
 Audio generation is added to mtmd in PR [#26254](https://github.com/ggml-org/llama.cpp/pull/26254)
 
 Currently, we support the 3-stage pipeline below which should cover most TTS models:
