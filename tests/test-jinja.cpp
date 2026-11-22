@@ -946,6 +946,12 @@ static void test_filters(testing & t) {
         "{\"a\": 1, \"b\": 2}"
     );
 
+    test_template(t, "tojson sort_keys=true nested objects",
+        "{{ data|tojson(sort_keys=true) }}",
+        {{"data", {{"z", {{"b", 2}, {"a", 1}}}, {"a", {{"d", 4}, {"c", 3}}}}}},
+        "{\"a\": {\"c\": 3, \"d\": 4}, \"z\": {\"a\": 1, \"b\": 2}}"
+    );
+
     test_template(t, "tojson",
         "{{ data|tojson }}",
         {{"data", {{"a", 1}, {"b", json::array({1, 2})}}}},

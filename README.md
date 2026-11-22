@@ -49,6 +49,7 @@ Syclonith is under active development.
 | MoE optimisation | Under development |
 | Flash Attention | Experimental |
 | Performance benchmarking | In progress |
+| Inking 2 Mini Support | In progress |
 
 Features and compatibility will be documented as they are implemented and validated.
 
