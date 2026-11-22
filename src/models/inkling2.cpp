@@ -310,7 +310,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         auto * sink = ggml_reshape_2d(ctx0, sinks, nh, n_tokens);
         table = ggml_permute(ctx0, table, 1, 0, 2, 3);
         auto * rel = ggml_rel_mask_sink(ctx0, table, distances[swa], mask, sink, 0, nh);
-        kq_mask = ggml_permute(ctx0, ggml_reshape_4d(ctx0, rel, n_kv, n_tokens, nh, 1), 0, 2, 1, 3);
+        kq_mask = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_4d(ctx0, rel, n_kv, n_tokens, nh, 1), 0, 2, 1, 3));
         sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, nh), 0.0f);
     } else {
         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, nh, n_tokens));
