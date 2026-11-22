@@ -3400,6 +3400,7 @@ inline void ggml_sycl_op_sum(ggml_backend_sycl_context & ctx, ggml_tensor *dst) 
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
     float * dst_dd = static_cast<float *>(dst->data);
 
     const int64_t ne = ggml_nelements(dst->src[0]);
@@ -3414,6 +3415,7 @@ inline void ggml_sycl_op_sum_rows(ggml_backend_sycl_context & ctx, ggml_tensor *
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
     float * dst_dd = static_cast<float *>(dst->data);
 
     const int64_t ncols = dst->src[0]->ne[0];
@@ -3431,6 +3433,7 @@ inline void ggml_sycl_op_mean(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
+    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
     float * dst_dd = static_cast<float *>(dst->data);
 
     const int64_t ncols = dst->src[0]->ne[0];
@@ -3517,6 +3520,7 @@ inline void ggml_sycl_op_diag_mask_inf(ggml_backend_sycl_context & ctx, ggml_ten
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
     dpct::queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
     float * dst_dd = static_cast<float *>(dst->data);
 
     const int64_t ne00 = dst->src[0]->ne[0];
