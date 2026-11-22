@@ -16,8 +16,9 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_VOCAB_SIZE_UNPADDED, hparams.n_vocab_unpadded);
     ml.get_key(LLM_KV_ACTIVATION_SITU_BETA, hparams.situ_beta);
     ml.get_key(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, hparams.situ_linear_beta);
-    ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE, hparams.expert_weights_scale);
-    ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING, hparams.f_final_logit_softcapping);
+    hparams.f_final_logit_softcapping = 0.0f;
+    ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE, hparams.expert_weights_scale, false);
+    ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING, hparams.f_final_logit_softcapping, false);
     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
     ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
     uint32_t n_pattern = 0;
@@ -29,7 +30,7 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error("inkling2: invalid dimensions, vocabulary, or layer pattern");
     }
     for (float value : {hparams.f_norm_rms_eps, hparams.f_qk_clip, hparams.f_relative_clip, hparams.situ_beta,
-                       hparams.situ_linear_beta, hparams.expert_weights_scale, hparams.f_final_logit_softcapping}) {
+                       hparams.situ_linear_beta}) {
         if (!std::isfinite(value) || value <= 0.0f) {
             throw std::runtime_error("inkling2: normalization, clipping and scaling parameters must be finite and positive");
         }
@@ -114,33 +115,6 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const 
     return std::make_unique<graph>(*this, params);
 }
 
-class llm_graph_input_inkling2_pos : public llm_graph_input_i {
-public:
-    const llama_kv_cache_context * cache[2];
-    ggml_tensor * distance[2];
-    uint32_t extent[2];
-
-    bool can_reuse(const llm_graph_params & params) override {
-        const auto * memory = static_cast<const llama_memory_hybrid_iswa_context *>(params.mctx);
-        cache[0] = memory->get_attn()->get_base();
-        cache[1] = memory->get_attn()->get_swa();
-        for (int i = 0; i < 2; ++i) {
-            if (distance[i]->ne[0] != cache[i]->get_n_kv() || distance[i]->ne[1] != params.ubatch.n_tokens) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    void set_input(const llama_ubatch * ubatch) override {
-        for (int i = 0; i < 2; ++i) {
-            if (distance[i]->buffer) {
-                cache[i]->set_input_relative_pos(distance[i], ubatch, extent[i]);
-            }
-        }
-    }
-};
-
 ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold) {
     if (scale) {
         cur = ggml_mul(ctx0, cur, scale);
@@ -212,21 +186,13 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_inputs() {
-    auto * inp = build_inp_mem_hybrid_iswa();
+    auto * inp = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
     attn = inp->get_attn();
     recr = inp->get_recr();
+    distances[0] = inp->self_rel_pos;
+    distances[1] = inp->self_rel_pos_swa;
     auto * positions = build_inp_pos();
     out_ids = build_inp_out_ids();
-    auto rel = std::make_unique<llm_graph_input_inkling2_pos>();
-    rel->cache[0] = attn->mctx->get_base();
-    rel->cache[1] = attn->mctx->get_swa();
-    rel->extent[0] = hparams.n_relative_extent;
-    rel->extent[1] = hparams.n_swa;
-    for (int i = 0; i < 2; ++i) {
-        distances[i] = rel->distance[i] = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, rel->cache[i]->get_n_kv(), n_tokens);
-        ggml_set_input(distances[i]);
-    }
-    res->add_input(std::move(rel));
     tau = ggml_scale_bias(ctx0, ggml_cast(ctx0, positions, GGML_TYPE_F32), 1.0f, 1.0f);
     tau = ggml_log(ctx0, ggml_clamp(ctx0, ggml_scale(ctx0, tau, 1.0f/hparams.n_log_scale_floor), 1.0f, INFINITY));
     tau = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, tau, hparams.f_log_scale_alpha, 1.0f), 1, 1, n_tokens);
@@ -297,28 +263,29 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     const int64_t streams = mask->ne[3];
     const int64_t n_kv = distances[swa]->ne[0];
     auto * sinks = build_lora_mm(l.attn_sink_proj, inputs[0]);
-    // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x nh
+
+    // Project relative features onto the bias table, then gather by query-to-cell distance.
     auto * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, l.attn_rel_bias, 0, 1, 0, 0), r);
-    if (cparams.flash_attn) {
-        // exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))).
-        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, nh, n_tokens));
-    } else {
-        // build_attn scales the bias along with QK; FA adds the mask after scaling QK.
+    // Fold each query's sink logit into the bias: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))).
+    table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, nh, n_tokens));
+    if (!cparams.flash_attn) {
+        // The dense mask is added after QK scaling in the non-flash path.
         table = ggml_scale(ctx0, table, sqrtf(hd));
     }
     table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
     auto * bias = ggml_get_rows(ctx0, table, distances[swa]);
     bias = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_4d(ctx0, bias, nh, n_kv, n_tokens/streams, streams), 2, 0, 1, 3));
-    ggml_tensor * fa_mask = nullptr;
+
+    // The sink is now represented in the bias; retain a zero-valued sink slot for softmax.
+    sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, nh), 0.0f);
+
+    // Flash attention requires an F16 mask; both paths consume the bias as part of the mask.
+    auto * kq_mask = ggml_cast(ctx0, mask, GGML_TYPE_F32);
+    kq_mask = ggml_add(ctx0, bias, kq_mask);
     if (cparams.flash_attn) {
-        fa_mask = ggml_cast(ctx0, ggml_add(ctx0, bias, ggml_cast(ctx0, mask, GGML_TYPE_F32)), GGML_TYPE_F16);
-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, nh), 0.0f);
-        bias = nullptr;
-    } else {
-        sinks = ggml_reshape_4d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0,
-                ggml_reshape_3d(ctx0, sinks, nh, n_tokens/streams, streams), 1, 0, 2, 3)), 1, n_tokens/streams, nh, streams);
+        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
     }
-    cur = build_attn(attn, nullptr, nullptr, nullptr, q, k, v, bias, sinks, nullptr, 1.0f/sqrtf(hd), il, fa_mask);
+    cur = build_attn(attn, nullptr, nullptr, nullptr, q, k, v, nullptr, sinks, nullptr, 1.0f/sqrtf(hd), il, kq_mask);
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(l.wqkv_gate, inputs[0])));
     cur = convolve(build_lora_mm(l.wo, cur), l.attn_post_conv, nullptr, state, history, recr, 2*kv);
     if (ip % hparams.attn_res_block_size == 0) {
@@ -350,8 +317,10 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     res->t_embd = cur;
     cur = build_lora_mm(model.output, cur);
     ggml_prec_set_acc(cur, GGML_PREC_F32);
-    const float cap = hparams.f_final_logit_softcapping;
-    cur = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/cap)), cap);
+    if (hparams.f_final_logit_softcapping != 0.0f) {
+        const float cap = hparams.f_final_logit_softcapping;
+        cur = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/cap)), cap);
+    }
     cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
     res->t_logits = cur;
     cb(cur, "result_output", -1);

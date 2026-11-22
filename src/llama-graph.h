@@ -771,6 +771,12 @@ public:
     llm_graph_input_attn_kv_iswa * get_attn() const { return inp_attn.get(); }
     llm_graph_input_rs           * get_recr() const { return inp_rs.get(); }
 
+    // Optional Inkling relative-position inputs. Other hybrid ISWA users leave these null.
+    ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
+    ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+    uint32_t rel_pos_extent     = 0;
+    uint32_t rel_pos_extent_swa = 0;
+
     const llama_cparams cparams;
 
     const llama_memory_hybrid_iswa_context * mctx;
@@ -1418,6 +1424,7 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+    llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa_rel(uint32_t extent, uint32_t extent_swa) const;
 
     //
     // pooling
