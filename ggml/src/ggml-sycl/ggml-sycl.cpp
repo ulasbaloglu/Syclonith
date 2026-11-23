@@ -5140,6 +5140,13 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
                 (long long) src0->ne[2], (long long) src0->ne[3]);
     }
     const bool reordered = reorder_qw(src0, ctx->stream());
+    if (reordered && src0->type == GGML_TYPE_Q4_K) {
+        fprintf(stderr, "[SYCL-XMX-SYNC] REORDER-WAIT-BEGIN type=q4_K ne=[%lld,%lld,%lld,%lld]\n",
+                (long long) src0->ne[0], (long long) src0->ne[1],
+                (long long) src0->ne[2], (long long) src0->ne[3]);
+        SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream()->wait()));
+        fprintf(stderr, "[SYCL-XMX-SYNC] REORDER-WAIT-DONE type=q4_K\n");
+    }
     if (diag_id < 120) {
         fprintf(stderr, "[SYCL-XMX-DIAG] OPT-REORDER-DONE id=%d result=%d\n", diag_id, (int) reordered);
     }
@@ -5166,6 +5173,13 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
         return;
     }
     if (reorder_qw(src0, ctx->stream())) {
+        if (src0->type == GGML_TYPE_Q4_K) {
+            fprintf(stderr, "[SYCL-XMX-SYNC] REORDER-ID-WAIT-BEGIN type=q4_K ne=[%lld,%lld,%lld,%lld]\n",
+                    (long long) src0->ne[0], (long long) src0->ne[1],
+                    (long long) src0->ne[2], (long long) src0->ne[3]);
+            SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream()->wait()));
+            fprintf(stderr, "[SYCL-XMX-SYNC] REORDER-ID-WAIT-DONE type=q4_K\n");
+        }
         extra->optimized_feature.reorder = true;
     }
 }

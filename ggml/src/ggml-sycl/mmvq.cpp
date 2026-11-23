@@ -2238,6 +2238,12 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 ggml_type_name(src0->type), (int) src0->type, (int) xmx_done);
     }
     if (xmx_done) {
+        if (src0->type == GGML_TYPE_Q4_K) {
+            fprintf(stderr, "[SYCL-XMX-SYNC] MMVQ-XMX-WAIT-BEGIN type=q4_K rows=%lld cols=%lld ne00=%lld\n",
+                    (long long) row_diff, (long long) src1_ncols, (long long) ne00);
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+            fprintf(stderr, "[SYCL-XMX-SYNC] MMVQ-XMX-WAIT-DONE type=q4_K\n");
+        }
         return;
     }
 #endif // GGML_SYCL_MMVQ_HAS_XMX
