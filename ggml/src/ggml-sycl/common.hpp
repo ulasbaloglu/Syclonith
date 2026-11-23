@@ -256,7 +256,7 @@ static inline bool ggml_sycl_xmx_supports_type(ggml_type type) {
 // the DPAS shapes and 2D block loads used by the XMX kernel are those of Xe2
 static inline bool ggml_sycl_xmx_supports_arch(gpu_arch arch) {
     return arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31 ||
-           arch == gpu_arch::intel_gpu_lnl_m;
+           arch == gpu_arch::intel_gpu_lnl_m || arch == gpu_arch::intel_gpu_arl_h;
 }
 
 // fewest columns for which the XMX kernel is faster than the other kernels
