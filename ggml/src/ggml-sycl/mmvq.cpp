@@ -2099,6 +2099,13 @@ static bool ggml_sycl_mul_mat_vec_q_xmx_type(ggml_type       type,
                                              int             ldd,
                                              int             glu_op,
                                              dpct::queue_ptr stream) {
+    // Temporary diagnostic: report the exact XMX MMVQ specialization selected.
+    // Keep this immediately before the type switch so the message is emitted even
+    // if the device is lost while the selected kernel is executing.
+    GGML_LOG_INFO("[SYCL-XMX-DIAG] MMVQ type=%s ne00=%d nrows=%lld ncols_dst=%lld "
+                  "short_rows=%d stride_y_bytes=%d ldd=%d glu_op=%d\n",
+                  ggml_type_name(type), ne00, (long long)nrows, (long long)ncols_dst,
+                  short_rows ? 1 : 0, stride_y_bytes, ldd, glu_op);
 #    define XMX_RUN(TRAITS)                                                                                       \
         ggml_sycl_mul_mat_vec_q_xmx_run<ggml_sycl_esimd::TRAITS>(short_rows, vx, vgate, vy, dst, ne00, nrows,     \
                                                                  ncols_dst, stride_y_bytes, ldd, glu_op, stream); \
