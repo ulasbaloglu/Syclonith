@@ -2224,8 +2224,20 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
     const int64_t row_diff = row_high - row_low;
 
 #ifdef GGML_SYCL_MMVQ_HAS_XMX
-    if (ggml_sycl_mul_mat_vec_q_xmx(ctx.device, src0, dst, src0_dd_i, src1_ddq_i, dst_dd_i, row_diff, src1_ncols,
-                                    src1_padded_col_size, stream)) {
+    if (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) {
+        fprintf(stderr, "[SYCL-XMX-DIAG] MMVQ-OP-ENTER type=%s(%d) rows=%lld cols=%lld ne00=%lld reordered=%d\n",
+                ggml_type_name(src0->type), (int) src0->type, (long long) row_diff,
+                (long long) src1_ncols, (long long) ne00,
+                (int) (static_cast<const ggml_tensor_extra_gpu *>(src0->extra) &&
+                       static_cast<const ggml_tensor_extra_gpu *>(src0->extra)->optimized_feature.reorder));
+    }
+    const bool xmx_done = ggml_sycl_mul_mat_vec_q_xmx(ctx.device, src0, dst, src0_dd_i, src1_ddq_i, dst_dd_i, row_diff, src1_ncols,
+                                                       src1_padded_col_size, stream);
+    if (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) {
+        fprintf(stderr, "[SYCL-XMX-DIAG] MMVQ-OP-XMX-RETURN type=%s(%d) handled=%d\n",
+                ggml_type_name(src0->type), (int) src0->type, (int) xmx_done);
+    }
+    if (xmx_done) {
         return;
     }
 #endif // GGML_SYCL_MMVQ_HAS_XMX

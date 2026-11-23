@@ -5036,6 +5036,14 @@ static bool reorder_qw_iq3_xxs(uint8_t * data_device, size_t size, dpct::queue_p
 }
 
 static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
+    static std::atomic<int> diag_reorder_count{0};
+    const int diag_id = diag_reorder_count.fetch_add(1, std::memory_order_relaxed);
+    if (diag_id < 120) {
+        fprintf(stderr, "[SYCL-XMX-DIAG] REORDER-BEGIN id=%d type=%s(%d) ne=[%lld,%lld,%lld,%lld] bytes=%zu\n",
+                diag_id, ggml_type_name(src0->type), (int) src0->type,
+                (long long) src0->ne[0], (long long) src0->ne[1],
+                (long long) src0->ne[2], (long long) src0->ne[3], ggml_nbytes(src0));
+    }
     uint8_t * data_device = (uint8_t *) src0->data;
     size_t ncols = src0->ne[0];
     size_t nrows = src0->ne[1];
@@ -5123,7 +5131,19 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
             break;
     }
 
-    if (reorder_qw(src0, ctx->stream())) {
+    static std::atomic<int> diag_opt_reorder_count{0};
+    const int diag_id = diag_opt_reorder_count.fetch_add(1, std::memory_order_relaxed);
+    if (diag_id < 120) {
+        fprintf(stderr, "[SYCL-XMX-DIAG] OPT-REORDER id=%d algo=%d type=%s(%d) ne=[%lld,%lld,%lld,%lld]\n",
+                diag_id, (int) mm_algorithm, ggml_type_name(src0->type), (int) src0->type,
+                (long long) src0->ne[0], (long long) src0->ne[1],
+                (long long) src0->ne[2], (long long) src0->ne[3]);
+    }
+    const bool reordered = reorder_qw(src0, ctx->stream());
+    if (diag_id < 120) {
+        fprintf(stderr, "[SYCL-XMX-DIAG] OPT-REORDER-DONE id=%d result=%d\n", diag_id, (int) reordered);
+    }
+    if (reordered) {
         extra->optimized_feature.reorder = true;  // Used to decode/dequan in next steps and avoid re-reordering
     }
 }
@@ -5244,6 +5264,23 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     bool use_mul_mat_q = can_use_mul_mat_q(src0, src1, dst);
 
+    if (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) {
+        static std::atomic<int> diag_dispatch_count{0};
+        const int diag_id = diag_dispatch_count.fetch_add(1, std::memory_order_relaxed);
+        if (diag_id < 160) {
+            const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+            const bool reordered = extra && extra->optimized_feature.reorder;
+            const bool xmx_batch = can_use_xmx_batch(ctx.device, src0, src1);
+            fprintf(stderr, "[SYCL-XMX-DIAG] MUL-MAT id=%d dev=%d arch=%d type=%s(%d) A=[%lld,%lld,%lld,%lld] B=[%lld,%lld,%lld,%lld] reorder=%d dmmv=%d mmvq=%d mmq=%d xmx_batch=%d xmx_min_cols=%d\n",
+                    diag_id, ctx.device, (int) ggml_sycl_info().devices[ctx.device].hw_info.arch,
+                    ggml_type_name(src0->type), (int) src0->type,
+                    (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
+                    (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+                    (int) reordered, (int) use_dequantize_mul_mat_vec, (int) use_mul_mat_vec_q,
+                    (int) use_mul_mat_q, (int) xmx_batch, ggml_sycl_xmx_min_cols(src0->type));
+        }
+    }
+
     // When reorder is enabled, both ESIMD, MMVQ and DMMV kernels may be used. For
     // best performance use ESIMD when supported, followed by MMVQ, and finally DMMV.
     // But the reordered ESIMD path cannot be used without reordered MMVQ. A later
@@ -5279,9 +5316,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         // KQ + KQV multi-batch
         ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
     } else if (use_dequantize_mul_mat_vec) {
+        if (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) fprintf(stderr, "[SYCL-XMX-DIAG] MUL-MAT-BRANCH DMMV type=%s cols=%lld\n", ggml_type_name(src0->type), (long long) src1->ne[1]);
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::DMMV);
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
     } else if (use_mul_mat_vec_q) {
+        if (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) fprintf(stderr, "[SYCL-XMX-DIAG] MUL-MAT-BRANCH MMVQ type=%s cols=%lld\n", ggml_type_name(src0->type), (long long) src1->ne[1]);
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
@@ -5290,6 +5329,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         }
     } else if (use_mul_mat_q) {
+        if (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) fprintf(stderr, "[SYCL-XMX-DIAG] MUL-MAT-BRANCH MMQ type=%s cols=%lld\n", ggml_type_name(src0->type), (long long) src1->ne[1]);
         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
     } else {
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
@@ -5348,6 +5388,9 @@ static bool ggml_sycl_mul_mat_glu_xmx(ggml_backend_sycl_context & ctx,
                                       const ggml_tensor *         wu,
                                       const ggml_tensor *         wg,
                                       const ggml_tensor *         act) {
+    fprintf(stderr, "[SYCL-XMX-DIAG] GLU-XMX-BEGIN up=%s(%d) gate=%s(%d) act_cols=%lld ne00=%lld\n",
+            ggml_type_name(wu->type), (int) wu->type, ggml_type_name(wg->type), (int) wg->type,
+            (long long) act->ne[1], (long long) wu->ne[0]);
     const int64_t ne00 = wu->ne[0];
     const int64_t ne11 = act->ne[1];
 
@@ -6015,6 +6058,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             }
             const bool src0_reordered =
                 src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
+            if (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K) {
+                fprintf(stderr, "[SYCL-XMX-DIAG] GROUPED-GEMM-TRY type=%s(%d) reordered=%d M=%lld K=%lld rows=%lld experts=%lld\n",
+                        ggml_type_name(src0->type), (int) src0->type, (int) src0_reordered,
+                        (long long) ne01, (long long) ne10, (long long) n_routed_rows, (long long) n_as);
+            }
             grouped = ggml_sycl_grouped_dequant_gemm(src0->type, src0_reordered, src0_original, nb02,
                                                      (const float *) src1_contiguous.get(), ggml_sycl_src1_prec(dst),
                                                      (float *) dst_contiguous.get(),

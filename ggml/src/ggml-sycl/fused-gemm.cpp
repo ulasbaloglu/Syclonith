@@ -8,6 +8,7 @@
 #include <mutex>
 #include <set>
 #include <unordered_map>
+#include <stdio.h>
 
 namespace mx = sycl::ext::oneapi::experimental::matrix;
 
@@ -1004,6 +1005,11 @@ static bool fg_fused_run(ggml_type src0_type, const void * src0, const void * sr
 bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, const void * src0, const void * src1, ggml_type src1_type,
                                   int32_t src1_prec, float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd,
                                   ggml_sycl_pool & pool, dpct::queue_ptr stream) {
+    if (src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q5_K || src0_type == GGML_TYPE_Q6_K) {
+        fprintf(stderr, "[SYCL-XMX-DIAG] FUSED-GEMM-ENTER type=%s(%d) M=%lld N=%lld K=%lld src1_type=%d prec=%d\n",
+                ggml_type_name(src0_type), (int) src0_type, (long long) M, (long long) N, (long long) K,
+                (int) src1_type, src1_prec);
+    }
     // every BN columns dequantize A again, so wide N is left to the library GEMM
     bool plain_ok = false;
     fg_visit_type(src0_type, false, [&](auto tag) { plain_ok = fg_plain_ok<typename decltype(tag)::type>(); });
@@ -1018,6 +1024,9 @@ bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, const void * src0, const 
         return false;
     }
     const int combo = fg_pick_combo(stream, src1_type, src1_prec);
+    if (src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q5_K || src0_type == GGML_TYPE_Q6_K) {
+        fprintf(stderr, "[SYCL-XMX-DIAG] FUSED-GEMM-SELECT combo=%d shape_ok=1\n", combo);
+    }
     if (combo < 0) {
         return false;
     }
@@ -1069,6 +1078,11 @@ bool ggml_sycl_grouped_dequant_gemm(ggml_type src0_type, bool reordered, const v
                                     const int64_t * expert_row_offsets, int64_t n_as, int64_t M, int64_t K,
                                     int64_t total_rows, std::vector<ggml_sycl_gg_tile> & tiles,
                                     ggml_sycl_pool & pool, dpct::queue_ptr stream) {
+    if (src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q5_K || src0_type == GGML_TYPE_Q6_K) {
+        fprintf(stderr, "[SYCL-XMX-DIAG] GROUPED-GEMM-ENTER type=%s(%d) reordered=%d M=%lld K=%lld total_rows=%lld experts=%lld\n",
+                ggml_type_name(src0_type), (int) src0_type, (int) reordered,
+                (long long) M, (long long) K, (long long) total_rows, (long long) n_as);
+    }
     int64_t n_active = 0;
     for (int64_t e = 0; e < n_as; ++e) {
         n_active += expert_row_offsets[e + 1] > expert_row_offsets[e];
@@ -1081,6 +1095,9 @@ bool ggml_sycl_grouped_dequant_gemm(ggml_type src0_type, bool reordered, const v
         return false;
     }
     const int combo = fg_pick_combo(stream, GGML_TYPE_F32, src1_prec);
+    if (src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q5_K || src0_type == GGML_TYPE_Q6_K) {
+        fprintf(stderr, "[SYCL-XMX-DIAG] GROUPED-GEMM-SELECT combo=%d active=%lld\n", combo, (long long) n_active);
+    }
     if (combo < 0) {
         return false;
     }
