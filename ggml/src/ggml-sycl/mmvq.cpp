@@ -2461,6 +2461,13 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                     // The quantized activation columns are contiguous with this byte stride.
                     const size_t stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                     const size_t stride_col_dst = dst->ne[0];
+
+                    // Drain earlier queued work before attributing a device loss
+                    // to the first Q4_K MMVQ column.
+                    fprintf(stderr, "[SYCL-Q4K-MMVQ-DIAG] PRE-WAIT-BEGIN before Q4_K MMVQ\n");
+                    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+                    fprintf(stderr, "[SYCL-Q4K-MMVQ-DIAG] PRE-WAIT-DONE before Q4_K MMVQ\n");
+
                     for (int col = 0; col < src1_ncols; ++col) {
                         fprintf(stderr, "[SYCL-Q4K-MMVQ-DIAG] COL-BEGIN col=%d/%lld rows=%lld ne00=%lld y_stride=%zu dst_stride=%zu\n",
                                 col, (long long) src1_ncols, (long long) row_diff, (long long) ne00,
