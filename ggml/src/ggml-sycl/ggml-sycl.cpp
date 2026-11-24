@@ -5190,8 +5190,16 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
     // need ne[0] % DMMV_X == 0.
     const int64_t dmmv_x_required = (src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F16) ?
                                     2*GGML_SYCL_DMMV_X : GGML_SYCL_DMMV_X;
+    // The native Q4_K DMMV kernel is a GEMV kernel, but it can process a
+    // small multi-column batch by launching once per column. Keep this
+    // exception narrow: the caller below handles only non-reordered Q4_K
+    // tensors and the ordinary single-batch decode/verification shape.
+    const bool q4k_multi_col = src0->type == GGML_TYPE_Q4_K &&
+                               src1->ne[1] > 1 && src1->ne[1] <= 8 &&
+                               src1->ne[2] == 1 && src1->ne[3] == 1;
+
     return ggml_sycl_supports_dmmv(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-           src0->ne[0] % dmmv_x_required == 0 && src1->ne[1] == 1;
+           src0->ne[0] % dmmv_x_required == 0 && (src1->ne[1] == 1 || q4k_multi_col);
 }
 
 // reordered weights of the types in ggml_sycl_xmx_supports_type() take the XMX kernel for wider batches
@@ -5265,12 +5273,22 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     // check data types and tensor shapes for custom matrix multiplication kernels:
     bool use_dequantize_mul_mat_vec = can_use_dequantize_mul_mat_vec(src0, src1, dst);
+    // The Q4_K multi-column DMMV loop below uses the full output-column stride;
+    // keep this special path on a single device, as split buffers use packed
+    // per-device partial-output strides.
+    if (split && src0->type == GGML_TYPE_Q4_K && src1->ne[1] > 1) {
+        use_dequantize_mul_mat_vec = false;
+    }
     if (src1->ne[1] == 1 && ggml_sycl_xmx_min_cols(src0->type) == 1 && can_use_xmx_batch(ctx.device, src0, src1)) {
         use_dequantize_mul_mat_vec = false;
     }
 #ifdef GGML_SYCL_F16
     // dmmv may convert src1 to f16 in this build [TAG_GGML_PREC]
-    use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && ggml_sycl_src1_f16_ok(dst);
+    // Q4_K's native DMMV kernel consumes F32 activations directly; unlike the
+    // other DMMV types, it does not rely on the optional src1->F16 conversion.
+    if (src0->type != GGML_TYPE_Q4_K || src1->ne[1] == 1) {
+        use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && ggml_sycl_src1_f16_ok(dst);
+    }
 #endif
 
     bool use_mul_mat_vec_q = can_use_mul_mat_vec_q(ctx.device, src0, src1, dst);
@@ -5300,8 +5318,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // multi-token call (ne[1] in 2..8) will take the MMVQ path and it would read the
     // reordered bytes as if they were still the unreordered layout.
 
-    if (!g_ggml_sycl_prioritize_dmmv && ((should_reorder_tensor(ctx, dst) &&
-                                          ggml_sycl_supports_reorder_mmvq(src0->type)))) {
+    if (!g_ggml_sycl_prioritize_dmmv &&
+        !(src0->type == GGML_TYPE_Q4_K && src1->ne[1] > 1) &&
+        should_reorder_tensor(ctx, dst) && ggml_sycl_supports_reorder_mmvq(src0->type)) {
         bool use = g_ggml_sycl_enable_esimd && ggml_sycl_supports_reorder_esimd(src0->type);
         // Arc770 get benefit with Q4_0 by skipping MMVQ path
         if (!(ggml_sycl_info().devices[ctx.device].hw_info.arch ==

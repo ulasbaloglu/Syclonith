@@ -2428,7 +2428,16 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
                     dequantize_mul_mat_vec_q4_K_sycl_reorder(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
                 }
             } else {
-                dequantize_mul_mat_vec_q4_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
+                // The native Q4_K DMMV kernel computes one vector at a time.
+                // For small multi-token batches, reuse that known-good kernel
+                // per column instead of entering the ARL-H native MMVQ path.
+                // src1 is F32 and column-major by tensor convention; dst stores
+                // each output column with dst->ne[0] elements between columns.
+                for (int64_t col = 0; col < src1_ncols; ++col) {
+                    const float * src1_col = src1_ddf_i + col * ne00;
+                    float * dst_col = dst_dd_i + col * dst->ne[0];
+                    dequantize_mul_mat_vec_q4_K_sycl(src0_dd_i, src1_col, dst_col, ne00, row_diff, stream);
+                }
             }
             break;
         case GGML_TYPE_Q5_K:
