@@ -2455,12 +2455,19 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                         reorder_mul_mat_vec_q4_k_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                     }
                 } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                    const int stride_col_y   = src1_padded_col_size / QK8_1;
-                    const int stride_col_dst = dst->ne[0];
-                    GGML_SYCL_DEBUG("Calling mul_mat_vec_q4_K_q8_1_sycl_switch_ncols ncols=%d\n", (int)src1_ncols);
-                    mul_mat_vec_q4_K_q8_1_sycl_switch_ncols(
-                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                        src1_ncols, stride_col_y, stride_col_dst, stream);
+                    // ARL-H has been losing the device in the native Q4_K multi-column
+                    // MMVQ kernel. Run the already-existing single-column kernel once
+                    // per activation column instead of using its ncols specialization.
+                    // The quantized activation columns are contiguous with this byte stride.
+                    const size_t stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
+                    const size_t stride_col_dst = dst->ne[0];
+                    for (int col = 0; col < src1_ncols; ++col) {
+                        mul_mat_vec_q4_K_q8_1_sycl(
+                            src0_dd_i,
+                            src1_ddq_i + col * stride_col_y_bytes,
+                            dst_dd_i + col * stride_col_dst,
+                            ne00, row_diff, stream);
+                    }
                     return;
                 } else if (i == 0 || src1_ncols == 1) {
                     GGML_SYCL_DEBUG("Calling mul_mat_vec_q4_K_q8_1_sycl\n");

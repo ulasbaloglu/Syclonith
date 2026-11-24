@@ -5178,12 +5178,15 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
         return;
     }
     if (reorder_qw(src0, ctx->stream())) {
-        if (src0->type == GGML_TYPE_Q4_K) {
-            fprintf(stderr, "[SYCL-XMX-SYNC] REORDER-ID-WAIT-BEGIN type=q4_K ne=[%lld,%lld,%lld,%lld]\n",
-                    (long long) src0->ne[0], (long long) src0->ne[1],
-                    (long long) src0->ne[2], (long long) src0->ne[3]);
+        // Large Q8_0 MoE tensors are reordered in-place in 32 MiB chunks using
+        // temporary USM storage. Complete this sizeable operation before allowing
+        // subsequent graph kernels to run, so an asynchronous reorder/device error
+        // is attributed here rather than surfacing at a later unrelated MMVQ wait.
+        if (src0->type == GGML_TYPE_Q8_0 && src0->ne[2] > 1 && ggml_nbytes(src0) >= (64u << 20)) {
+            fprintf(stderr, "[SYCL-XMX-SYNC] Q8_0-MOE-REORDER-WAIT-BEGIN bytes=%zu experts=%lld\n",
+                    ggml_nbytes(src0), (long long) src0->ne[2]);
             SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream()->wait()));
-            fprintf(stderr, "[SYCL-XMX-SYNC] REORDER-ID-WAIT-DONE type=q4_K\n");
+            fprintf(stderr, "[SYCL-XMX-SYNC] Q8_0-MOE-REORDER-WAIT-DONE\n");
         }
         extra->optimized_feature.reorder = true;
     }
