@@ -2238,12 +2238,6 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 ggml_type_name(src0->type), (int) src0->type, (int) xmx_done);
     }
     if (xmx_done) {
-        if (src0->type == GGML_TYPE_Q4_K) {
-            fprintf(stderr, "[SYCL-XMX-SYNC] MMVQ-XMX-WAIT-BEGIN type=q4_K rows=%lld cols=%lld ne00=%lld\n",
-                    (long long) row_diff, (long long) src1_ncols, (long long) ne00);
-            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
-            fprintf(stderr, "[SYCL-XMX-SYNC] MMVQ-XMX-WAIT-DONE type=q4_K\n");
-        }
         return;
     }
 #endif // GGML_SYCL_MMVQ_HAS_XMX
@@ -2462,24 +2456,12 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                     const size_t stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                     const size_t stride_col_dst = dst->ne[0];
 
-                    // Drain earlier queued work before attributing a device loss
-                    // to the first Q4_K MMVQ column.
-                    fprintf(stderr, "[SYCL-Q4K-MMVQ-DIAG] PRE-WAIT-BEGIN before Q4_K MMVQ\n");
-                    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
-                    fprintf(stderr, "[SYCL-Q4K-MMVQ-DIAG] PRE-WAIT-DONE before Q4_K MMVQ\n");
-
                     for (int col = 0; col < src1_ncols; ++col) {
-                        fprintf(stderr, "[SYCL-Q4K-MMVQ-DIAG] COL-BEGIN col=%d/%lld rows=%lld ne00=%lld y_stride=%zu dst_stride=%zu\n",
-                                col, (long long) src1_ncols, (long long) row_diff, (long long) ne00,
-                                stride_col_y_bytes, stride_col_dst);
                         mul_mat_vec_q4_K_q8_1_sycl(
                             src0_dd_i,
                             src1_ddq_i + col * stride_col_y_bytes,
                             dst_dd_i + col * stride_col_dst,
                             ne00, row_diff, stream);
-                        fprintf(stderr, "[SYCL-Q4K-MMVQ-DIAG] COL-WAIT-BEGIN col=%d\n", col);
-                        SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
-                        fprintf(stderr, "[SYCL-Q4K-MMVQ-DIAG] COL-WAIT-DONE col=%d\n", col);
                     }
                     return;
                 } else if (i == 0 || src1_ncols == 1) {

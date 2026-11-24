@@ -4538,6 +4538,11 @@ static inline void sycl_ext_free(dpct::queue_ptr stream, void * ptr) {
     // If async allocation extension is not available, use_async should always be false.
     GGML_ASSERT(!use_async);
 #endif
+    // The Level Zero allocator path uses zeMemFree, which is not ordered with
+    // commands already submitted to the SYCL queue. Temporary reorder buffers
+    // are consumed asynchronously by kernels and copies, so drain the queue
+    // before releasing their storage when async USM free is unavailable.
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
     ggml_sycl_free_device(ptr, *stream);
 }
 
@@ -4567,6 +4572,9 @@ struct sycl_reorder_temp_buffer {
             return;
         }
         if (host_fallback) {
+            // Host USM fallback has no queue-ordered async-free operation.
+            // Reorder kernels may still be reading this buffer, so wait first.
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
             sycl::free(ptr, *stream);
         } else {
             sycl_ext_free(stream, ptr);
@@ -5143,13 +5151,6 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
                 (long long) src0->ne[2], (long long) src0->ne[3]);
     }
     const bool reordered = reorder_qw(src0, ctx->stream());
-    if (reordered && src0->type == GGML_TYPE_Q4_K) {
-        fprintf(stderr, "[SYCL-XMX-SYNC] REORDER-WAIT-BEGIN type=q4_K ne=[%lld,%lld,%lld,%lld]\n",
-                (long long) src0->ne[0], (long long) src0->ne[1],
-                (long long) src0->ne[2], (long long) src0->ne[3]);
-        SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream()->wait()));
-        fprintf(stderr, "[SYCL-XMX-SYNC] REORDER-WAIT-DONE type=q4_K\n");
-    }
     if (diag_id < 120) {
         fprintf(stderr, "[SYCL-XMX-DIAG] OPT-REORDER-DONE id=%d result=%d\n", diag_id, (int) reordered);
     }
@@ -5178,16 +5179,6 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
         return;
     }
     if (reorder_qw(src0, ctx->stream())) {
-        // Large Q8_0 MoE tensors are reordered in-place in 32 MiB chunks using
-        // temporary USM storage. Complete this sizeable operation before allowing
-        // subsequent graph kernels to run, so an asynchronous reorder/device error
-        // is attributed here rather than surfacing at a later unrelated MMVQ wait.
-        if (src0->type == GGML_TYPE_Q8_0 && src0->ne[2] > 1 && ggml_nbytes(src0) >= (64u << 20)) {
-            fprintf(stderr, "[SYCL-XMX-SYNC] Q8_0-MOE-REORDER-WAIT-BEGIN bytes=%zu experts=%lld\n",
-                    ggml_nbytes(src0), (long long) src0->ne[2]);
-            SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream()->wait()));
-            fprintf(stderr, "[SYCL-XMX-SYNC] Q8_0-MOE-REORDER-WAIT-DONE\n");
-        }
         extra->optimized_feature.reorder = true;
     }
 }

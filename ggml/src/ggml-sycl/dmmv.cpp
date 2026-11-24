@@ -2430,15 +2430,6 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
             } else {
                 dequantize_mul_mat_vec_q4_K_sycl(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
             }
-            // Diagnostic: isolate asynchronous failures in Q4_K DMMV before
-            // later graph operations can surface them at an unrelated wait.
-            fprintf(stderr, "[SYCL-Q4K-DMMV-DIAG] WAIT-BEGIN ne00=%lld rows=%lld reorder=%d\\n",
-                    (long long) ne00, (long long) row_diff,
-                    (int) (((ggml_tensor_extra_gpu *) dst->src[0]->extra) &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder));
-            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
-            fprintf(stderr, "[SYCL-Q4K-DMMV-DIAG] WAIT-DONE ne00=%lld rows=%lld\\n",
-                    (long long) ne00, (long long) row_diff);
             break;
         case GGML_TYPE_Q5_K:
             if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
