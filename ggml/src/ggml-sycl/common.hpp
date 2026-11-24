@@ -243,7 +243,6 @@ static inline bool ggml_sycl_xmx_supports_type(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
-        case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_Q8_0:
@@ -261,8 +260,6 @@ static inline bool ggml_sycl_xmx_supports_arch(gpu_arch arch) {
 
 // fewest columns for which the XMX kernel is faster than the other kernels
 static inline int ggml_sycl_xmx_min_cols(ggml_type type) {
-    // Keep Q4_K single-token decode on the regular MMVQ path. The XMX ESIMD
-    // Q4_K specialization is not reliable for the one-column ARL-H workload.
     return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K ? 1 : 2;
 }
 

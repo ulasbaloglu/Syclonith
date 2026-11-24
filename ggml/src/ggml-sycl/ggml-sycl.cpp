@@ -5104,7 +5104,10 @@ static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_ten
 
 static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                             ggml_tensor * dst, mul_mat_algo mm_algorithm) {
-    if (!should_reorder_tensor(*ctx, dst)) {
+    // Q4_K reordered kernels (including the multi-column MMVQ fallback) are
+    // unstable on the current Intel ARL-H SYCL path. Keep Q4_K in its native
+    // layout so the regular, non-reordered DMMV/MMVQ kernels are selected.
+    if (src0->type == GGML_TYPE_Q4_K || !should_reorder_tensor(*ctx, dst)) {
         return;
     }
 
@@ -5157,7 +5160,9 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
 
 // Lazily reorder supported MoE expert weights once their fused path is used.
 static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
-    if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
+    // Match the regular matmul policy above: do not create reordered Q4_K
+    // expert weights, which would later enter the unsupported reordered path.
+    if (src0->type == GGML_TYPE_Q4_K || !g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
         return;
     }
     if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q4_K &&
