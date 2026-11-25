@@ -4,6 +4,9 @@
 #include "ggml.h"
 #include "gated_delta_net.hpp"
 #include <cmath>
+#include <algorithm>
+#include <cstdlib>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 
 template <int S_v, bool KDA, bool keep_rs_t>
@@ -162,6 +165,169 @@ void gated_delta_net_sycl(const float *     q,
     }
 }
 
+// Subgroup-16 GDN prefill specialization adapted from the engine's gdn_xe recurrence.
+//
+// The engine kernel assumes its own (row, head, column) state layout. GGML stores
+// GDN state as [row, column, head, sequence] with row contiguous, so we retain
+// GGML's coalesced row mapping and borrow the useful part of the Xe kernel:
+// stage each Q/K vector once per 16-column workgroup, double-buffer it in local
+// memory, and prefetch token t+1 while computing token t. Each subgroup handles
+// four output columns in registers; four subgroups cover 16 columns per workgroup.
+template <int S_v>
+static void launch_gated_delta_net_sg16_prefill(
+        const float * q, const float * k, const float * v,
+        const float * g, const float * beta,
+        const float * curr_state, float * dst, float * state,
+        int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3,
+        int64_t sv1, int64_t sv2, int64_t sv3,
+        int64_t sb1, int64_t sb2, int64_t sb3,
+        int64_t n_k_heads, const sycl::uint3 rq3_magic,
+        float scale, dpct::queue_ptr stream) {
+    static_assert(S_v == 128, "the SG16 GDN prefill tile is specialized for state width 128");
+    constexpr int SG = 16;
+    constexpr int LANES_PER_WG = 64;
+    constexpr int COLS_PER_SG = 4;
+    constexpr int COLS_PER_WG = 16;
+    constexpr int ROWS_PER_LANE = S_v / SG;
+    constexpr int COL_BLOCKS = S_v / COLS_PER_WG;
+
+    const size_t n_groups = (size_t) n_seqs * (size_t) H * COL_BLOCKS;
+    stream->submit([&](sycl::handler & cgh) {
+        // Two banks, each containing one Q and one K vector (2*S floats).
+        sycl::local_accessor<float, 1> qk_banks(sycl::range<1>(4 * S_v), cgh);
+        const sycl::ext::oneapi::experimental::properties props{
+            sycl::ext::intel::experimental::grf_size<256>};
+        cgh.parallel_for<class GgmlGdnSg16Prefill>(
+            sycl::nd_range<1>(sycl::range<1>(n_groups * LANES_PER_WG),
+                              sycl::range<1>(LANES_PER_WG)),
+            props,
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                const auto sg = it.get_sub_group();
+                const unsigned lane = (unsigned) sg.get_local_linear_id();
+                const unsigned sg_id = (unsigned) sg.get_group_linear_id();
+                const unsigned tid = (unsigned) it.get_local_linear_id();
+
+                const size_t group_id = it.get_group_linear_id();
+                const unsigned cb = (unsigned) (group_id % COL_BLOCKS);
+                const size_t head_seq = group_id / COL_BLOCKS;
+                const int64_t head = (int64_t) (head_seq % (size_t) H);
+                const int64_t seq = (int64_t) (head_seq / (size_t) H);
+                const uint32_t q_head = (uint32_t) (head % n_k_heads);
+                const uint32_t q_seq = fastdiv((uint32_t) seq, rq3_magic);
+
+                const int col[COLS_PER_SG] = {
+                    (int) (cb * COLS_PER_WG + sg_id * COLS_PER_SG + 0),
+                    (int) (cb * COLS_PER_WG + sg_id * COLS_PER_SG + 1),
+                    (int) (cb * COLS_PER_WG + sg_id * COLS_PER_SG + 2),
+                    (int) (cb * COLS_PER_WG + sg_id * COLS_PER_SG + 3),
+                };
+
+                const float * state_in[COLS_PER_SG];
+                float * state_out[COLS_PER_SG];
+                float s[COLS_PER_SG][ROWS_PER_LANE];
+#pragma unroll
+                for (int c = 0; c < COLS_PER_SG; ++c) {
+                    // GGML state layout: [sequence, head, column, row], row contiguous.
+                    const int64_t base = ((seq * H + head) * S_v + col[c]) * S_v;
+                    state_in[c] = curr_state + base;
+                    state_out[c] = state + base;
+#pragma unroll
+                    for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                        s[c][r] = state_in[c][r * SG + lane];
+                    }
+                }
+
+                float nq[2], nk[2], nv[COLS_PER_SG], ng = 0.0f, nb = 0.0f;
+                auto fetch = [&](int64_t t) {
+                    const float * q_t = q + (int64_t) q_seq * sq3 + t * sq2 + (int64_t) q_head * sq1;
+                    const float * k_t = k + (int64_t) q_seq * sq3 + t * sq2 + (int64_t) q_head * sq1;
+#pragma unroll
+                    for (int u = 0; u < 2; ++u) {
+                        nq[u] = q_t[tid + u * LANES_PER_WG];
+                        nk[u] = k_t[tid + u * LANES_PER_WG];
+                    }
+                    const float * v_t = v + seq * sv3 + t * sv2 + head * sv1;
+#pragma unroll
+                    for (int c = 0; c < COLS_PER_SG; ++c) nv[c] = v_t[col[c]];
+                    const int64_t gb = seq * sb3 + t * sb2 + head * sb1;
+                    ng = g[gb];
+                    nb = beta[gb];
+                };
+
+                if (n_tokens > 0) fetch(0);
+                for (int64_t t = 0; t < n_tokens; ++t) {
+                    const unsigned bank = (unsigned) (t & 1) * (2 * S_v);
+#pragma unroll
+                    for (int u = 0; u < 2; ++u) {
+                        qk_banks[bank + tid + u * LANES_PER_WG] = nq[u];
+                        qk_banks[bank + S_v + tid + u * LANES_PER_WG] = nk[u];
+                    }
+                    const float v_now[COLS_PER_SG] = { nv[0], nv[1], nv[2], nv[3] };
+                    const float gate_now = ng;
+                    const float beta_now = nb;
+
+                    it.barrier(sycl::access::fence_space::local_space);
+                    // Global loads for the next token are issued before this token's recurrence.
+                    if (t + 1 < n_tokens) fetch(t + 1);
+
+                    const float decay = sycl::native::exp(gate_now);
+#pragma unroll
+                    for (int c = 0; c < COLS_PER_SG; ++c) {
+                        float kv_partial = 0.0f;
+#pragma unroll
+                        for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                            const int i = r * SG + (int) lane;
+                            kv_partial += s[c][r] * qk_banks[bank + S_v + i];
+                        }
+                        const float kv = warp_reduce_sum<SG>(kv_partial);
+                        const float delta = (v_now[c] - decay * kv) * beta_now;
+
+                        float out_partial = 0.0f;
+#pragma unroll
+                        for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                            const int i = r * SG + (int) lane;
+                            s[c][r] = decay * s[c][r] + qk_banks[bank + S_v + i] * delta;
+                            out_partial += s[c][r] * qk_banks[bank + i];
+                        }
+                        const float out_col = warp_reduce_sum<SG>(out_partial) * scale;
+                        if (lane == 0) {
+                            dst[((seq * n_tokens + t) * H + head) * S_v + col[c]] = out_col;
+                        }
+                    }
+                }
+
+                // This specialization is used only for K=1 (no rollback snapshots).
+#pragma unroll
+                for (int c = 0; c < COLS_PER_SG; ++c) {
+#pragma unroll
+                    for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                        state_out[c][r * SG + lane] = s[c][r];
+                    }
+                }
+            });
+    });
+}
+
+static bool ggml_sycl_gdn_sg16_prefill_requested() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_SYCL_GDN_SG16_PREFILL");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_sycl_gdn_sg16_device(dpct::queue_ptr stream) {
+    const auto device = stream->get_device();
+    if (!device.is_gpu() || device.get_info<sycl::info::device::vendor_id>() != 0x8086) {
+        return false;
+    }
+    const auto subgroup_sizes = device.get_info<sycl::info::device::sub_group_sizes>();
+    return std::find(subgroup_sizes.begin(), subgroup_sizes.end(), size_t(16)) != subgroup_sizes.end() &&
+           device.get_info<sycl::info::device::max_work_group_size>() >= 64 &&
+           device.get_info<sycl::info::device::local_mem_size>() >= 4 * 128 * sizeof(float);
+}
+
 template <bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net(const float *   q_d,
                                    const float *   k_d,
@@ -318,6 +484,7 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int K = ggml_get_op_params_i32(dst, 0);
     const bool keep_rs = K > 1;
+    const sycl::uint3 rq3_magic = init_fastdiv_values(rq3);
 
     // recurrent state -> dst tail (after attention scores), or the cache when fusing
     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
@@ -325,6 +492,27 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
     if (cache != nullptr) {
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
+    }
+
+    // Experimental SG16 GDN prefill path. It is opt-in until measured on ARL-H;
+    // KDA/snapshot cases and unsupported geometries always use the existing kernel.
+    if (ggml_sycl_gdn_sg16_prefill_requested() && !kda && !keep_rs && K == 1 &&
+        S_v == 128 && n_tokens >= 128 && neqk1 > 0 && H % neqk1 == 0) {
+        dpct::queue_ptr gdn_stream = ctx.stream();
+        if (ggml_sycl_gdn_sg16_device(gdn_stream)) {
+            GGML_SYCL_DEBUG("[SYCL] GDN SG16 prefill: Q/K double-buffered, 16-column workgroups (S=%lld, H_v=%lld, H_k=%lld, T=%lld, seq=%lld)\n",
+                            (long long) S_v, (long long) H, (long long) neqk1,
+                            (long long) n_tokens, (long long) n_seqs);
+            launch_gated_delta_net_sg16_prefill<128>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+                neqk1, rq3_magic, scale, gdn_stream);
+            return;
+        }
+        GGML_SYCL_DEBUG("[SYCL] GDN SG16 prefill: device unsupported, using existing recurrence\n");
+    } else if (ggml_sycl_gdn_sg16_prefill_requested()) {
+        GGML_SYCL_DEBUG("[SYCL] GDN SG16 prefill: shape/op unsupported (S=%lld, K=%d, KDA=%d, H=%lld, H_k=%lld, T=%lld), using existing recurrence\n",
+                        (long long) S_v, K, (int) kda, (long long) H,
+                        (long long) neqk1, (long long) n_tokens);
     }
 
     if (kda) {
