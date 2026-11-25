@@ -112,6 +112,8 @@ int g_ggml_sycl_enable_vmm = 1;
 int g_ggml_sycl_enable_fusion = 1;
 int g_ggml_sycl_enable_esimd = 1;
 int g_ggml_sycl_mmvq_wide = 1;
+int g_ggml_sycl_mmvq_wide_k = 0;
+int g_ggml_sycl_mmvq_wide_k_rpw = 1;
 int g_ggml_sycl_enable_xmx_esimd = 1;
 int g_ggml_sycl_xmx_max_cols = GGML_SYCL_XMX_MAX_COLS_DEFAULT;
 int g_ggml_sycl_xmx_glu_max_cols = GGML_SYCL_XMX_GLU_MAX_COLS;
@@ -443,6 +445,11 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_fusion = ggml_sycl_get_env("GGML_SYCL_ENABLE_FUSION", 1);
         g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
         g_ggml_sycl_mmvq_wide = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE", 1);
+        g_ggml_sycl_mmvq_wide_k = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE_K", 0);
+        {
+            const int rpw = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE_K_RPW", 1);
+            g_ggml_sycl_mmvq_wide_k_rpw = (rpw == 2 || rpw == 4) ? rpw : 1;
+        }
         g_ggml_sycl_enable_xmx_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_XMX_ESIMD", 1);
         g_ggml_sycl_xmx_max_cols = std::max(0, ggml_sycl_get_env("GGML_SYCL_XMX_MAX_COLS", GGML_SYCL_XMX_MAX_COLS_DEFAULT));
         g_ggml_sycl_xmx_glu_max_cols =
@@ -595,6 +602,8 @@ static void ggml_check_sycl() try {
 #endif
 
         GGML_LOG_INFO("  GGML_SYCL_MMVQ_WIDE: %d\n", g_ggml_sycl_mmvq_wide);
+        GGML_LOG_INFO("  GGML_SYCL_MMVQ_WIDE_K: %d\n", g_ggml_sycl_mmvq_wide_k);
+        GGML_LOG_INFO("  GGML_SYCL_MMVQ_WIDE_K_RPW: %d\n", g_ggml_sycl_mmvq_wide_k_rpw);
 
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_XMX_ESIMD: %d\n", g_ggml_sycl_enable_xmx_esimd);
         GGML_LOG_INFO("  GGML_SYCL_XMX_MAX_COLS: %d\n", g_ggml_sycl_xmx_max_cols);
@@ -5712,8 +5721,8 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const int       n_experts_used   = (int) n_ids_per_group;
     const int       nrows            = (int) src0->ne[1];
 
-    // Lazily reorder supported expert weights into a per-expert SoA layout, then run the reorder
-    // GEMV. Placed after the bail checks so a non-dispatchable op does not pay the reorder cost.
+    // Lazily reorder supported expert weights into per-expert SoA layout. The experimental
+    // Q4_K/Q5_K wide-load MMVQ path supports both raw and reordered layouts.
     opt_for_reorder_id(&ctx, src0);
     const ggml_tensor_extra_gpu * src0_extra =
         static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
@@ -6007,8 +6016,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         bool grouped = false;
         if (ggml_is_contiguous(src0) && src1->type == GGML_TYPE_F32 &&
             dst->type == GGML_TYPE_F32 && nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0) {
-            // the grouped GEMM reads the reorder (SoA) layout faster, and the first decode step installs it
-            // anyway: install it here already, so prefill does not depend on whether a decode ran before
+            // Keep the SoA reorder for grouped GEMM (and one-token decode); the wide-load
+            // Q4_K/Q5_K MMVQ kernel has dedicated loaders for both raw and reordered layouts.
             if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
                 ggml_sycl_xmx_gather_type_enabled(src0->type)) {
                 opt_for_reorder_id(&ctx, src0);
@@ -6020,6 +6029,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                                      (float *) dst_contiguous.get(),
                                                      expert_row_offsets.data(), n_as, ne01, ne10, n_routed_rows,
                                                      ctx.mmid_tile_schedule_host, ctx.pool(), stream);
+            if (g_ggml_sycl_debug &&
+                (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K)) {
+                GGML_LOG_INFO("SYCL MoE prefill: grouped XMX %s for %s\n",
+                              grouped ? "path active" : "path unavailable; using per-expert fallback",
+                              src0->type == GGML_TYPE_Q4_K ? "Q4_K" : "Q5_K");
+            }
         }
 
         for (int64_t i02 = 0; i02 < n_as && !grouped; i02++) {

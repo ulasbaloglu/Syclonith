@@ -2708,6 +2708,342 @@ static void launch_mul_mat_vec_q_moe(
     });
 }
 
+// Wide-load Q4_K/Q5_K MoE GEMV kernels adapted from Strata's native_mmvq
+// implementation, which is based on the ggml authors' MIT-licensed llama.cpp
+// MMVQ implementation. Copyright (c) 2023-2026 The ggml authors.
+// The engine kernel assumes 32-lane subgroups; this version derives the number
+// of superblocks handled by each subgroup from WARP_SIZE (16 on this backend).
+static __dpct_inline__ int mmvq_wide_k_dp4a4(const sycl::int4 a, const sycl::int4 b, int acc) {
+    acc = dpct::dp4a(a.x(), b.x(), acc);
+    acc = dpct::dp4a(a.y(), b.y(), acc);
+    acc = dpct::dp4a(a.z(), b.z(), acc);
+    return dpct::dp4a(a.w(), b.w(), acc);
+}
+
+static __dpct_inline__ sycl::int4 mmvq_wide_k_load_q8_16(const block_q8_1 * b, int half) {
+    // block_q8_1::qs is 4-byte aligned, not necessarily 16-byte aligned. Use
+    // SYCL's aligned-4 vector load (the engine's ld_i4_a4 pattern).
+    const int * p = reinterpret_cast<const int *>(b->qs) + 4 * half;
+    sycl::int4 v;
+    v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space,
+                                      sycl::access::decorated::no>(p));
+    return v;
+}
+
+static __dpct_inline__ sycl::int4 mmvq_wide_k_load_i4(const void * p) {
+    sycl::int4 v;
+    v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space,
+                                      sycl::access::decorated::no>(reinterpret_cast<const int *>(p)));
+    return v;
+}
+
+static __dpct_inline__ void mmvq_wide_k_scale_min(const uint8_t * sc, int j, float & s, float & m) {
+    if (j < 4) {
+        s = float(sc[j] & 63);
+        m = float(sc[j + 4] & 63);
+    } else {
+        s = float((sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4));
+        m = float((sc[j + 4] >> 4) | ((sc[j] >> 6) << 4));
+    }
+}
+
+struct mmvq_wide_q4_k {
+    using block_type = block_q4_K;
+    struct weights {
+        sycl::int4 lo, hi;
+        float dl, dh, ml, mh;
+        int sb, half;
+    };
+    struct activations {
+        sycl::int4 ua, uc;
+        float da, dc;
+    };
+
+    static weights load(const block_type * b, int lane_group) {
+        weights r;
+        r.sb   = 2 * (lane_group >> 1);
+        r.half = lane_group & 1;
+        const sycl::int4 q = reinterpret_cast<const sycl::int4 *>(b->qs)[lane_group];
+        r.lo = sycl::int4(q.x() & 0x0F0F0F0F, q.y() & 0x0F0F0F0F,
+                          q.z() & 0x0F0F0F0F, q.w() & 0x0F0F0F0F);
+        r.hi = sycl::int4((q.x() >> 4) & 0x0F0F0F0F, (q.y() >> 4) & 0x0F0F0F0F,
+                          (q.z() >> 4) & 0x0F0F0F0F, (q.w() >> 4) & 0x0F0F0F0F);
+
+        const sycl::float2 dm = b->dm.convert<float, sycl::rounding_mode::automatic>();
+        float s0, m0, s1, m1;
+        mmvq_wide_k_scale_min(b->scales, r.sb, s0, m0);
+        mmvq_wide_k_scale_min(b->scales, r.sb + 1, s1, m1);
+        r.dl = dm.x() * s0;
+        r.ml = dm.y() * m0;
+        r.dh = dm.x() * s1;
+        r.mh = dm.y() * m1;
+        return r;
+    }
+
+    static activations act(const block_q8_1 * x, int lane_group) {
+        const int sb = 2 * (lane_group >> 1);
+        const int half = lane_group & 1;
+        const block_q8_1 * a = x + sb;
+        const block_q8_1 * c = x + sb + 1;
+        return {mmvq_wide_k_load_q8_16(a, half), mmvq_wide_k_load_q8_16(c, half),
+                float(a->ds[0]), float(c->ds[0])};
+    }
+
+    static activations act_soa(const uint8_t * x, int ncols, int kbx, int lane_group) {
+        const int sb = 2 * (lane_group >> 1);
+        const int half = lane_group & 1;
+        const int b0 = kbx * 8 + sb;
+        const int b1 = b0 + 1;
+        const int8_t * q = reinterpret_cast<const int8_t *>(x);
+        const sycl::half2 * ds = reinterpret_cast<const sycl::half2 *>(x + ncols);
+        return {mmvq_wide_k_load_i4(q + size_t(b0) * QK8_1 + half * 16),
+                mmvq_wide_k_load_i4(q + size_t(b1) * QK8_1 + half * 16),
+                float(ds[b0].x()), float(ds[b1].x())};
+    }
+
+    static float dot(const weights & r, const activations & a) {
+        const sycl::int4 ones(0x01010101, 0x01010101, 0x01010101, 0x01010101);
+        return a.da * (r.dl * float(mmvq_wide_k_dp4a4(r.lo, a.ua, 0)) -
+                       r.ml * float(mmvq_wide_k_dp4a4(ones, a.ua, 0))) +
+               a.dc * (r.dh * float(mmvq_wide_k_dp4a4(r.hi, a.uc, 0)) -
+                       r.mh * float(mmvq_wide_k_dp4a4(ones, a.uc, 0)));
+    }
+
+    static float apply(const weights & r, const block_q8_1 * x) {
+        return dot(r, act(x, (r.sb / 2) * 2 + r.half));
+    }
+
+    // The fork's in-place MoE reorder stores each expert in [qs][scales][dm]
+    // SoA form. Keep the wide-load kernel usable after that optimization too.
+    static weights load_soa(const uint8_t * base, int nblocks, int block_idx, int lane_group) {
+        weights r;
+        r.sb   = 2 * (lane_group >> 1);
+        r.half = lane_group & 1;
+        const uint8_t * qs = base + size_t(block_idx) * 128 + lane_group * 16;
+        const sycl::int4 q = mmvq_wide_k_load_i4(qs);
+        r.lo = sycl::int4(q.x() & 0x0F0F0F0F, q.y() & 0x0F0F0F0F,
+                          q.z() & 0x0F0F0F0F, q.w() & 0x0F0F0F0F);
+        r.hi = sycl::int4((q.x() >> 4) & 0x0F0F0F0F, (q.y() >> 4) & 0x0F0F0F0F,
+                          (q.z() >> 4) & 0x0F0F0F0F, (q.w() >> 4) & 0x0F0F0F0F);
+        const uint8_t * scales = base + size_t(nblocks) * 128 + size_t(block_idx) * 12;
+        const sycl::half2 * dm = reinterpret_cast<const sycl::half2 *>(base + size_t(nblocks) * 140 + size_t(block_idx) * 4);
+        float s0, m0, s1, m1;
+        mmvq_wide_k_scale_min(scales, r.sb, s0, m0);
+        mmvq_wide_k_scale_min(scales, r.sb + 1, s1, m1);
+        r.dl = float(dm->x()) * s0;
+        r.ml = float(dm->y()) * m0;
+        r.dh = float(dm->x()) * s1;
+        r.mh = float(dm->y()) * m1;
+        return r;
+    }
+
+    static float apply_soa(const weights & r, const uint8_t * x, int ncols, int kbx) {
+        return dot(r, act_soa(x, ncols, kbx, (r.sb / 2) * 2 + r.half));
+    }
+};
+
+struct mmvq_wide_q5_k {
+    using block_type = block_q5_K;
+    using weights = mmvq_wide_q4_k::weights;
+    using activations = mmvq_wide_q4_k::activations;
+
+    static weights load(const block_type * b, int lane_group) {
+        weights r;
+        r.sb   = 2 * (lane_group >> 1);
+        r.half = lane_group & 1;
+        const sycl::int4 q = reinterpret_cast<const sycl::int4 *>(b->qs)[lane_group];
+        const sycl::int4 h = reinterpret_cast<const sycl::int4 *>(b->qh)[r.half];
+        const int sl = r.sb;
+        const int sh = r.sb + 1;
+        const auto high_bit = [](int v, int bit) { return ((v >> bit) & 0x01010101) << 4; };
+        r.lo = sycl::int4((q.x() & 0x0F0F0F0F) | high_bit(h.x(), sl),
+                          (q.y() & 0x0F0F0F0F) | high_bit(h.y(), sl),
+                          (q.z() & 0x0F0F0F0F) | high_bit(h.z(), sl),
+                          (q.w() & 0x0F0F0F0F) | high_bit(h.w(), sl));
+        r.hi = sycl::int4(((q.x() >> 4) & 0x0F0F0F0F) | high_bit(h.x(), sh),
+                          ((q.y() >> 4) & 0x0F0F0F0F) | high_bit(h.y(), sh),
+                          ((q.z() >> 4) & 0x0F0F0F0F) | high_bit(h.z(), sh),
+                          ((q.w() >> 4) & 0x0F0F0F0F) | high_bit(h.w(), sh));
+
+        const sycl::float2 dm = b->dm.convert<float, sycl::rounding_mode::automatic>();
+        float s0, m0, s1, m1;
+        mmvq_wide_k_scale_min(b->scales, r.sb, s0, m0);
+        mmvq_wide_k_scale_min(b->scales, r.sb + 1, s1, m1);
+        r.dl = dm.x() * s0;
+        r.ml = dm.y() * m0;
+        r.dh = dm.x() * s1;
+        r.mh = dm.y() * m1;
+        return r;
+    }
+
+    static activations act(const block_q8_1 * x, int lane_group) {
+        return mmvq_wide_q4_k::act(x, lane_group);
+    }
+    static activations act_soa(const uint8_t * x, int ncols, int kbx, int lane_group) {
+        return mmvq_wide_q4_k::act_soa(x, ncols, kbx, lane_group);
+    }
+    static float dot(const weights & r, const activations & a) {
+        return mmvq_wide_q4_k::dot(r, a);
+    }
+    static float apply(const weights & r, const block_q8_1 * x) {
+        return dot(r, act(x, (r.sb / 2) * 2 + r.half));
+    }
+
+    static weights load_soa(const uint8_t * base, int nblocks, int block_idx, int lane_group) {
+        weights r;
+        r.sb   = 2 * (lane_group >> 1);
+        r.half = lane_group & 1;
+        const uint8_t * qs = base + size_t(block_idx) * 128 + lane_group * 16;
+        const uint8_t * qh = base + size_t(nblocks) * 128 + size_t(block_idx) * 32 + r.half * 16;
+        const sycl::int4 q = mmvq_wide_k_load_i4(qs);
+        const sycl::int4 h = mmvq_wide_k_load_i4(qh);
+        const int sl = r.sb;
+        const int sh = r.sb + 1;
+        const auto high_bit = [](int v, int bit) { return ((v >> bit) & 0x01010101) << 4; };
+        r.lo = sycl::int4((q.x() & 0x0F0F0F0F) | high_bit(h.x(), sl),
+                          (q.y() & 0x0F0F0F0F) | high_bit(h.y(), sl),
+                          (q.z() & 0x0F0F0F0F) | high_bit(h.z(), sl),
+                          (q.w() & 0x0F0F0F0F) | high_bit(h.w(), sl));
+        r.hi = sycl::int4(((q.x() >> 4) & 0x0F0F0F0F) | high_bit(h.x(), sh),
+                          ((q.y() >> 4) & 0x0F0F0F0F) | high_bit(h.y(), sh),
+                          ((q.z() >> 4) & 0x0F0F0F0F) | high_bit(h.z(), sh),
+                          ((q.w() >> 4) & 0x0F0F0F0F) | high_bit(h.w(), sh));
+        const uint8_t * scales = base + size_t(nblocks) * 160 + size_t(block_idx) * 12;
+        const sycl::half2 * dm = reinterpret_cast<const sycl::half2 *>(base + size_t(nblocks) * 172 + size_t(block_idx) * 4);
+        float s0, m0, s1, m1;
+        mmvq_wide_k_scale_min(scales, r.sb, s0, m0);
+        mmvq_wide_k_scale_min(scales, r.sb + 1, s1, m1);
+        r.dl = float(dm->x()) * s0;
+        r.ml = float(dm->y()) * m0;
+        r.dh = float(dm->x()) * s1;
+        r.mh = float(dm->y()) * m1;
+        return r;
+    }
+
+    static float apply_soa(const weights & r, const uint8_t * x, int ncols, int kbx) {
+        return dot(r, act_soa(x, ncols, kbx, (r.sb / 2) * 2 + r.half));
+    }
+};
+
+template <typename format, bool reordered, int rows_per_subgroup>
+static void mul_mat_vec_q_moe_wide_k(
+    const void * vx_base, const void * vy_base, const int32_t * ids_dev,
+    float * dst_base, const int ncols, const int nrows,
+    const size_t expert_weight_stride, const size_t dst_row_stride,
+    const size_t src1_row_stride, const sycl::nd_item<3> & item) {
+    static_assert(WARP_SIZE >= 8 && WARP_SIZE % 8 == 0,
+                  "wide Q4_K/Q5_K MMVQ requires a subgroup size divisible by 8");
+    static_assert(rows_per_subgroup == 1 || rows_per_subgroup == 2 || rows_per_subgroup == 4,
+                  "wide Q4_K/Q5_K row reuse supports 1, 2 or 4 rows per subgroup");
+
+    const int expert_idx = item.get_group(1);
+    const int expert     = ids_dev[expert_idx];
+    const int row0       = (item.get_group(2) * GGML_SYCL_MMV_Y + item.get_local_id(1)) * rows_per_subgroup;
+    const auto sg        = item.get_sub_group();
+    const int lane       = sg.get_local_linear_id();
+
+    if (row0 >= nrows) {
+        return;
+    }
+
+    float acc[rows_per_subgroup] = {};
+    float * dst = reinterpret_cast<float *>(reinterpret_cast<char *>(dst_base) +
+                                            size_t(expert_idx) * dst_row_stride);
+    if (expert < 0) {
+        if (sg.leader()) {
+#pragma unroll
+            for (int r = 0; r < rows_per_subgroup; ++r) {
+                if (row0 + r < nrows) dst[row0 + r] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    const uint8_t * weights_base = reinterpret_cast<const uint8_t *>(vx_base) +
+                                   size_t(expert) * expert_weight_stride;
+    const uint8_t * x = reinterpret_cast<const uint8_t *>(vy_base) +
+                        size_t(expert_idx) * src1_row_stride;
+    const int blocks_per_row = ncols / QK_K;
+    const int lane_group = lane & 7;
+    const int subgroup_group = lane >> 3;
+    const int blocks_per_expert = nrows * blocks_per_row;
+    const auto * raw_weights = reinterpret_cast<const typename format::block_type *>(weights_base);
+    const auto * raw_x = reinterpret_cast<const block_q8_1 *>(x);
+
+    for (int kbx = subgroup_group; kbx < blocks_per_row; kbx += WARP_SIZE / 8) {
+        const auto a = [&]() {
+            if constexpr (reordered) return format::act_soa(x, ncols, kbx, lane_group);
+            else return format::act(raw_x + kbx * (QK_K / QK8_1), lane_group);
+        }();
+#pragma unroll
+        for (int r = 0; r < rows_per_subgroup; ++r) {
+            const int row = row0 + r;
+            if (row < nrows) {
+                const int block_idx = row * blocks_per_row + kbx;
+                const auto w = [&]() {
+                    if constexpr (reordered) return format::load_soa(weights_base, blocks_per_expert, block_idx, lane_group);
+                    else return format::load(raw_weights + block_idx, lane_group);
+                }();
+                acc[r] += format::dot(w, a);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < rows_per_subgroup; ++r) {
+        for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+            acc[r] += dpct::permute_sub_group_by_xor(sg, acc[r], mask);
+        }
+        if (sg.leader() && row0 + r < nrows) dst[row0 + r] = acc[r];
+    }
+}
+
+template <typename format, bool reordered = false, int rows_per_subgroup = 1>
+static void launch_mul_mat_vec_q_moe_wide_k(
+    const void * vx_base, const void * vy, const int32_t * ids_dev,
+    float * dst_base, const int ncols, const int nrows, const int n_experts_used,
+    const size_t expert_weight_stride, const size_t dst_row_stride,
+    const size_t src1_row_stride, dpct::queue_ptr stream) {
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y * rows_per_subgroup - 1) /
+                            (GGML_SYCL_MMV_Y * rows_per_subgroup);
+    const sycl::range<3> block_nums(1, unsigned(n_experts_used), unsigned(block_num_y));
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_q_moe_wide_k<format, reordered, rows_per_subgroup>(
+                    vx_base, vy, ids_dev, dst_base, ncols, nrows,
+                    expert_weight_stride, dst_row_stride, src1_row_stride, item);
+            });
+    });
+}
+
+template <typename format, bool reordered = false>
+static void launch_mul_mat_vec_q_moe_wide_k_rpw(
+    const void * vx_base, const void * vy, const int32_t * ids_dev,
+    float * dst_base, const int ncols, const int nrows, const int n_experts_used,
+    const size_t expert_weight_stride, const size_t dst_row_stride,
+    const size_t src1_row_stride, dpct::queue_ptr stream) {
+    switch (g_ggml_sycl_mmvq_wide_k_rpw) {
+        case 4:
+            launch_mul_mat_vec_q_moe_wide_k<format, reordered, 4>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            break;
+        case 2:
+            launch_mul_mat_vec_q_moe_wide_k<format, reordered, 2>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            break;
+        default:
+            launch_mul_mat_vec_q_moe_wide_k<format, reordered, 1>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            break;
+    }
+}
+
 bool ggml_sycl_mul_mat_vec_q_id(
     enum ggml_type     src0_type,
     const void *       vx_base,
@@ -2764,11 +3100,23 @@ bool ggml_sycl_mul_mat_vec_q_id(
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
             return true;
         case GGML_TYPE_Q4_K:
+            if (g_ggml_sycl_mmvq_wide_k) {
+                launch_mul_mat_vec_q_moe_wide_k_rpw<mmvq_wide_q4_k>(
+                    vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                    expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+                return true;
+            }
             launch_mul_mat_vec_q_moe<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
             return true;
         case GGML_TYPE_Q5_K:
+            if (g_ggml_sycl_mmvq_wide_k) {
+                launch_mul_mat_vec_q_moe_wide_k_rpw<mmvq_wide_q5_k>(
+                    vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                    expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+                return true;
+            }
             launch_mul_mat_vec_q_moe<QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
@@ -3023,14 +3371,26 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
             return true;
         case GGML_TYPE_Q4_K:
-            launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(
-                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
-                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            if (g_ggml_sycl_mmvq_wide_k) {
+                launch_mul_mat_vec_q_moe_wide_k_rpw<mmvq_wide_q4_k, true>(
+                    vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                    expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            } else {
+                launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(
+                    vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                    expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            }
             return true;
         case GGML_TYPE_Q5_K:
-            launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K>>(
-                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
-                expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            if (g_ggml_sycl_mmvq_wide_k) {
+                launch_mul_mat_vec_q_moe_wide_k_rpw<mmvq_wide_q5_k, true>(
+                    vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                    expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            } else {
+                launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K>>(
+                    vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                    expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+            }
             return true;
         case GGML_TYPE_Q6_K:
             // Use paired rows when the Q6_K adapter provides split weight/activation operations.
