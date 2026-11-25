@@ -183,7 +183,8 @@ static void launch_gated_delta_net_sg16_prefill(
         int64_t sv1, int64_t sv2, int64_t sv3,
         int64_t sb1, int64_t sb2, int64_t sb3,
         int64_t n_k_heads, const sycl::uint3 rq3_magic,
-        float scale, dpct::queue_ptr stream) {
+        float scale, int64_t state_slot_stride, int K,
+        dpct::queue_ptr stream) {
     static_assert(S_v == 128, "the SG16 GDN prefill tile is specialized for state width 128");
     constexpr int SG = 16;
     constexpr int LANES_PER_WG = 64;
@@ -224,14 +225,16 @@ static void launch_gated_delta_net_sg16_prefill(
                 };
 
                 const float * state_in[COLS_PER_SG];
-                float * state_out[COLS_PER_SG];
+                int64_t state_base[COLS_PER_SG];
                 float s[COLS_PER_SG][ROWS_PER_LANE];
 #pragma unroll
                 for (int c = 0; c < COLS_PER_SG; ++c) {
-                    // GGML state layout: [sequence, head, column, row], row contiguous.
+                    // GGML state layout: [row, column, head, sequence], row contiguous.
+                    // Keep the per-column base so every requested rollback snapshot can
+                    // be written with the same sequence/head/column mapping.
                     const int64_t base = ((seq * H + head) * S_v + col[c]) * S_v;
+                    state_base[c] = base;
                     state_in[c] = curr_state + base;
-                    state_out[c] = state + base;
 #pragma unroll
                     for (int r = 0; r < ROWS_PER_LANE; ++r) {
                         s[c][r] = state_in[c][r * SG + lane];
@@ -280,6 +283,8 @@ static void launch_gated_delta_net_sg16_prefill(
                             const int i = r * SG + (int) lane;
                             kv_partial += s[c][r] * qk_banks[bank + S_v + i];
                         }
+                        // A subgroup handles one output column at a time; all 16 lanes
+                        // therefore contribute rows for the same column.
                         const float kv = warp_reduce_sum<SG>(kv_partial);
                         const float delta = (v_now[c] - decay * kv) * beta_now;
 
@@ -295,14 +300,21 @@ static void launch_gated_delta_net_sg16_prefill(
                             dst[((seq * n_tokens + t) * H + head) * S_v + col[c]] = out_col;
                         }
                     }
-                }
 
-                // This specialization is used only for K=1 (no rollback snapshots).
+                    // GGML rollback convention: slot 0 is newest, slot 1 is one
+                    // token older.  For a chunk longer than K, only the last K
+                    // post-token states are retained.  This matches the reference
+                    // GDN implementation for both fused-cache and ordinary outputs.
+                    const int64_t target_slot = n_tokens - 1 - t;
+                    if (target_slot >= 0 && target_slot < K) {
 #pragma unroll
-                for (int c = 0; c < COLS_PER_SG; ++c) {
+                        for (int c = 0; c < COLS_PER_SG; ++c) {
+                            float * snapshot = state + target_slot * state_slot_stride + state_base[c];
 #pragma unroll
-                    for (int r = 0; r < ROWS_PER_LANE; ++r) {
-                        state_out[c][r * SG + lane] = s[c][r];
+                            for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                                snapshot[r * SG + lane] = s[c][r];
+                            }
+                        }
                     }
                 }
             });
@@ -494,25 +506,29 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
         state_slot_stride = cache->slot_stride;
     }
 
-    // Experimental SG16 GDN prefill path. It is opt-in until measured on ARL-H;
-    // KDA/snapshot cases and unsupported geometries always use the existing kernel.
-    if (ggml_sycl_gdn_sg16_prefill_requested() && !kda && !keep_rs && K == 1 &&
-        S_v == 128 && n_tokens >= 128 && neqk1 > 0 && H % neqk1 == 0) {
+    // Experimental SG16 GDN prefill path.  It supports ordinary GDN and the
+    // K>1 rollback-snapshot output used by fused-cache graphs.  Keep T>=2 so
+    // single-token decode continues to use the established recurrence kernel.
+    const int64_t state_slot_min_stride = S_v * S_v * H * n_seqs;
+    const bool sg16_shape_supported = !kda && S_v == 128 && n_tokens >= 2 &&
+                                      K >= 1 && neqk1 > 0 && H % neqk1 == 0 &&
+                                      (K == 1 || state_slot_stride >= state_slot_min_stride);
+    if (ggml_sycl_gdn_sg16_prefill_requested() && sg16_shape_supported) {
         dpct::queue_ptr gdn_stream = ctx.stream();
         if (ggml_sycl_gdn_sg16_device(gdn_stream)) {
-            GGML_SYCL_DEBUG("[SYCL] GDN SG16 prefill: Q/K double-buffered, 16-column workgroups (S=%lld, H_v=%lld, H_k=%lld, T=%lld, seq=%lld)\n",
-                            (long long) S_v, (long long) H, (long long) neqk1,
+            GGML_SYCL_DEBUG("[SYCL] GDN SG16 prefill: Q/K double-buffered, 16-column workgroups (S=%lld, H_v=%lld, H_k=%lld, K=%d, T=%lld, seq=%lld)\n",
+                            (long long) S_v, (long long) H, (long long) neqk1, K,
                             (long long) n_tokens, (long long) n_seqs);
             launch_gated_delta_net_sg16_prefill<128>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
-                neqk1, rq3_magic, scale, gdn_stream);
+                neqk1, rq3_magic, scale, state_slot_stride, K, gdn_stream);
             return;
         }
         GGML_SYCL_DEBUG("[SYCL] GDN SG16 prefill: device unsupported, using existing recurrence\n");
     } else if (ggml_sycl_gdn_sg16_prefill_requested()) {
-        GGML_SYCL_DEBUG("[SYCL] GDN SG16 prefill: shape/op unsupported (S=%lld, K=%d, KDA=%d, H=%lld, H_k=%lld, T=%lld), using existing recurrence\n",
+        GGML_SYCL_DEBUG("[SYCL] GDN SG16 prefill: shape/op unsupported (S=%lld, K=%d, KDA=%d, H=%lld, H_k=%lld, T=%lld, state_slot_stride=%lld), using existing recurrence\n",
                         (long long) S_v, K, (int) kda, (long long) H,
-                        (long long) neqk1, (long long) n_tokens);
+                        (long long) neqk1, (long long) n_tokens, (long long) state_slot_stride);
     }
 
     if (kda) {
