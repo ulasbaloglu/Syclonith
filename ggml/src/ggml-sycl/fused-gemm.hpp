@@ -87,12 +87,15 @@ bool ggml_sycl_grouped_xmxg_q4k_q5k(ggml_type src0_type, bool reordered, const v
                                      size_t expert_stride, const float * src1, int32_t src1_prec, float * dst,
                                      const int64_t * expert_row_offsets, int64_t n_as, int64_t M, int64_t K,
                                      int64_t total_rows, ggml_sycl_pool & pool, dpct::queue_ptr stream);
-// Fused weighted down projection. row_mapping maps compact expert-sorted rows back to
-// (slot, token); route_weights is [n_tokens, n_ids], and sum_dst is [M, n_tokens].
+// Fused weighted down projection. row_mapping (device) maps compact expert-sorted rows back to
+// (slot, token); row_mapping_host is the matching host copy used only by the optional
+// GGML_SYCL_MOE_DOWN_SUM_LOCAL grouped-partial reduction. route_weights is [n_tokens, n_ids],
+// and sum_dst is [M, n_tokens].
 bool ggml_sycl_grouped_xmxg_q4k_q5k_sum(ggml_type src0_type, bool reordered, const void * src0_base,
                                           size_t expert_stride, const float * src1, int32_t src1_prec,
                                           const int64_t * expert_row_offsets, int64_t n_as, int64_t M, int64_t K,
                                           int64_t total_rows, const mmid_row_mapping * row_mapping,
+                                          const mmid_row_mapping * row_mapping_host,
                                           const float * route_weights, int n_ids, int64_t n_tokens,
                                           float * sum_dst, ggml_sycl_pool & pool, dpct::queue_ptr stream);
 

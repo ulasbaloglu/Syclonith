@@ -1083,6 +1083,17 @@ struct group {
     int32_t tstart[MAX_EXPERTS + 1];
     int32_t n;
 };
+
+// One batch of at most MAX_EXPERTS experts. The local-reduction experiment writes
+// this batch's compact expert products to a reusable scratch buffer, then reduces
+// the rows for each touched token without global floating-point atomics.
+struct local_reduce_batch {
+    group experts;
+    int32_t row_begin;
+    int32_t row_end;
+    int32_t token_begin;
+    int32_t token_count;
+};
 template <int SGM_, int SGN_, int MT_, int NT_> struct config {
     static constexpr int SGM = SGM_, SGN = SGN_, MT = MT_, NT = NT_;
     static constexpr int KS = 32, BM = SGM * MT * 8, BN = SGN * NT * SG, WG = SGM * SGN * SG;
@@ -1162,12 +1173,12 @@ static int fill_tiles(group & gp) {
     return t;
 }
 
-template <typename T, bool REORDERED, bool Q5, bool SUMMED> class small_kernel;
-template <typename T, bool REORDERED, bool Q5, bool SUMMED> class large_kernel;
-template <class C, class Name, typename T, bool REORDERED, bool Q5, bool SUMMED>
+template <typename T, bool REORDERED, bool Q5, bool SUMMED, bool LOCAL_REDUCE> class small_kernel;
+template <typename T, bool REORDERED, bool Q5, bool SUMMED, bool LOCAL_REDUCE> class large_kernel;
+template <class C, class Name, typename T, bool REORDERED, bool Q5, bool SUMMED, bool LOCAL_REDUCE>
 static void launch(sycl::queue & q, const group & gp, const T * X, float * Y, int blocks,
                    int ntiles, int N, int K, const mmid_row_mapping * row_mapping,
-                   const float * route_weights, int n_ids, float * sum_dst) {
+                   const float * route_weights, int n_ids, float * sum_dst, int group_row_base) {
     constexpr int BM = C::BM, BN = C::BN, KS = C::KS, WG = C::WG, TN = SG;
     constexpr int LDA = KS + 8, LDB = KS + 8;
     const int nb = N / BN;
@@ -1185,8 +1196,10 @@ static void launch(sycl::queue & q, const group & gp, const T * X, float * Y, in
             const int rows = sycl::min(BM, gp.off[e + 1] - gp.off[e] - m0);
             const T * Xe = X + ((size_t) gp.off[e] + m0) * K;
             float * Ye = nullptr;
-            if constexpr (!SUMMED) {
-                Ye = Y + ((size_t) gp.off[e] + m0) * N;
+            if constexpr (!SUMMED || LOCAL_REDUCE) {
+                const size_t row = (size_t) gp.off[e] + (size_t) m0;
+                const size_t row_offset = LOCAL_REDUCE ? row - (size_t) group_row_base : row;
+                Ye = Y + row_offset * (size_t) N;
             }
             const uint8_t * w = gp.w[e];
             const int n0 = (int) it.get_group(1) * BN;
@@ -1237,11 +1250,9 @@ static void launch(sycl::queue & q, const group & gp, const T * X, float * Y, in
                 if (r >= rows) continue;
                 for (int j = 0; j < C::NT; ++j) {
                     const int c = n0 + sgn * C::NT * TN + j * TN;
-                    if constexpr (SUMMED) {
-                        // The down projection is already weighted by its route coefficient here.
-                        // Store the 8x8 accumulator into per-subgroup SLM, then atomically add each
-                        // routed row into its token's final output. This avoids materializing the
-                        // [M, n_expert_used, n_tokens] product tensor.
+                    if constexpr (SUMMED && !LOCAL_REDUCE) {
+                        // Atomic baseline: different expert workgroups may contribute to the
+                        // same token/output element, so the final accumulation is global.
                         float * st = reinterpret_cast<float *>(pa) + sgid * 8 * TN;
                         mx::joint_matrix_store(sg, acc[i][j],
                             sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(st),
@@ -1281,40 +1292,77 @@ static void launch(sycl::queue & q, const group & gp, const T * X, float * Y, in
     });
 }
 
-template <class C, typename T, bool Q5, bool SUMMED>
+template <class C, typename T, bool Q5, bool SUMMED, bool LOCAL_REDUCE = false>
 static void launch_layout(sycl::queue & q, const group & gp, const T * X, float * Y, int blocks,
                           int ntiles, int N, int K, bool reordered,
                           const mmid_row_mapping * row_mapping, const float * route_weights,
-                          int n_ids, float * sum_dst) {
+                          int n_ids, float * sum_dst, int group_row_base = 0) {
     if (reordered) {
         if constexpr (std::is_same_v<C, small_config>) {
-            launch<C, small_kernel<T, true, Q5, SUMMED>, T, true, Q5, SUMMED>(q, gp, X, Y, blocks, ntiles, N, K,
-                row_mapping, route_weights, n_ids, sum_dst);
+            launch<C, small_kernel<T, true, Q5, SUMMED, LOCAL_REDUCE>, T, true, Q5, SUMMED, LOCAL_REDUCE>(q, gp, X, Y, blocks, ntiles, N, K,
+                row_mapping, route_weights, n_ids, sum_dst, group_row_base);
         } else {
-            launch<C, large_kernel<T, true, Q5, SUMMED>, T, true, Q5, SUMMED>(q, gp, X, Y, blocks, ntiles, N, K,
-                row_mapping, route_weights, n_ids, sum_dst);
+            launch<C, large_kernel<T, true, Q5, SUMMED, LOCAL_REDUCE>, T, true, Q5, SUMMED, LOCAL_REDUCE>(q, gp, X, Y, blocks, ntiles, N, K,
+                row_mapping, route_weights, n_ids, sum_dst, group_row_base);
         }
     } else {
         if constexpr (std::is_same_v<C, small_config>) {
-            launch<C, small_kernel<T, false, Q5, SUMMED>, T, false, Q5, SUMMED>(q, gp, X, Y, blocks, ntiles, N, K,
-                row_mapping, route_weights, n_ids, sum_dst);
+            launch<C, small_kernel<T, false, Q5, SUMMED, LOCAL_REDUCE>, T, false, Q5, SUMMED, LOCAL_REDUCE>(q, gp, X, Y, blocks, ntiles, N, K,
+                row_mapping, route_weights, n_ids, sum_dst, group_row_base);
         } else {
-            launch<C, large_kernel<T, false, Q5, SUMMED>, T, false, Q5, SUMMED>(q, gp, X, Y, blocks, ntiles, N, K,
-                row_mapping, route_weights, n_ids, sum_dst);
+            launch<C, large_kernel<T, false, Q5, SUMMED, LOCAL_REDUCE>, T, false, Q5, SUMMED, LOCAL_REDUCE>(q, gp, X, Y, blocks, ntiles, N, K,
+                row_mapping, route_weights, n_ids, sum_dst, group_row_base);
         }
     }
 }
-template <typename T, bool SUMMED>
+// Reduction kernel for one expert batch. Each work-item owns one final output element,
+// scans only that token's top-k slots, and accumulates the partial rows belonging to this
+// expert batch in registers. The queue is in-order, so batches update sum_dst serially.
+static void reduce_group_partials(sycl::queue & q, const float * products, const int32_t * route_to_compact,
+                                  const int32_t * group_tokens, int32_t group_token_count,
+                                  int32_t group_row_begin, int32_t group_row_end,
+                                  const float * route_weights, int32_t n_ids, int32_t M,
+                                  float * sum_dst) {
+    constexpr size_t WG = 128;
+    const size_t items = (size_t) group_token_count * (size_t) M;
+    const size_t global = ((items + WG - 1) / WG) * WG;
+    q.parallel_for(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+        const size_t flat = (size_t) it.get_global_linear_id();
+        if (flat >= items) return;
+        const int32_t token = group_tokens[flat / (size_t) M];
+        const int32_t col = (int32_t) (flat % (size_t) M);
+        float partial = 0.0f;
+        for (int32_t slot = 0; slot < n_ids; ++slot) {
+            const int32_t compact = route_to_compact[(size_t) token * (size_t) n_ids + (size_t) slot];
+            if (compact >= group_row_begin && compact < group_row_end) {
+                const float value = products[(size_t) (compact - group_row_begin) * (size_t) M + (size_t) col];
+                const float weight = route_weights[(size_t) token * (size_t) n_ids + (size_t) slot];
+                partial += value * weight;
+            }
+        }
+        // Exactly one work-item owns each (token, output-column) for this batch.
+        // Different expert batches are submitted sequentially on the in-order SYCL queue.
+        sum_dst[(size_t) token * (size_t) M + (size_t) col] += partial;
+    });
+}
+
+template <typename T, bool SUMMED, bool LOCAL_REDUCE = false>
 static bool run_grouped(ggml_type src0_type, bool reordered, const void * src0_base, size_t expert_stride,
                         const float * src1, float * dst, const int64_t * expert_row_offsets,
                         int64_t n_as, int64_t M, int64_t K, int64_t valid_rows,
                         int blocks, ggml_sycl_pool & pool, dpct::queue_ptr stream,
                         const mmid_row_mapping * row_mapping, const float * route_weights,
-                        int n_ids, int64_t n_tokens, float * sum_dst) {
+                        int n_ids, int64_t n_tokens, float * sum_dst,
+                        const mmid_row_mapping * row_mapping_host = nullptr) {
     const uint64_t elements64 = (uint64_t) valid_rows * (uint64_t) K;
     if (elements64 > SIZE_MAX / sizeof(T)) return false;
     const size_t elements = (size_t) elements64;
+    // Keep pool allocation handles in allocation order. The SYCL VMM pool is LIFO:
+    // destruction must release group_tokens, group_products, route_map, then packed_x.
     ggml_sycl_pool_alloc<T> packed_x(pool, elements);
+    ggml_sycl_pool_alloc<int32_t> route_to_compact_dev(pool);
+    ggml_sycl_pool_alloc<float> group_products(pool);
+    ggml_sycl_pool_alloc<int32_t> group_tokens_dev(pool);
     if (packed_x.get() == nullptr) {
         GGML_LOG_WARN("%s: unable to allocate %zu bytes for packed MoE activations; using fallback\n",
                       __func__, elements * sizeof(T));
@@ -1322,6 +1370,102 @@ static bool run_grouped(ggml_type src0_type, bool reordered, const void * src0_b
     }
 
     sycl::queue & q = *stream;
+    std::vector<local_reduce_batch> local_batches;
+    std::vector<int32_t> local_group_tokens;
+    size_t max_group_rows = 0;
+    if constexpr (LOCAL_REDUCE) {
+        if constexpr (!SUMMED) {
+            return false;
+        } else {
+            if (row_mapping_host == nullptr || row_mapping == nullptr || route_weights == nullptr ||
+                sum_dst == nullptr || n_ids <= 0 || n_tokens <= 0 || n_tokens > INT32_MAX) {
+                return false;
+            }
+            const uint64_t route_entries = (uint64_t) n_ids * (uint64_t) n_tokens;
+            // The inverse route map is an additional host/device allocation. Keep the
+            // experimental path bounded; large contexts fall back to the atomic kernel.
+            if (route_entries > SIZE_MAX / sizeof(int32_t) ||
+                route_entries * sizeof(int32_t) > 256u * 1024u * 1024u) {
+                GGML_LOG_WARN("%s: local MoE route map exceeds 256 MiB; using atomic path\n", __func__);
+                return false;
+            }
+            std::vector<int32_t> route_to_compact_host((size_t) route_entries, -1);
+            for (int64_t r = 0; r < valid_rows; ++r) {
+                const mmid_row_mapping mapping = row_mapping_host[r];
+                if (mapping.i1 < 0 || mapping.i1 >= n_ids || mapping.i2 < 0 || mapping.i2 >= n_tokens) {
+                    return false;
+                }
+                const size_t index = (size_t) mapping.i2 * (size_t) n_ids + (size_t) mapping.i1;
+                if (route_to_compact_host[index] != -1) {
+                    return false; // duplicate slot/token mapping: use the atomic path
+                }
+                route_to_compact_host[index] = (int32_t) r;
+            }
+
+            std::vector<uint8_t> token_seen((size_t) n_tokens, 0);
+            int64_t e = 0;
+            while (e < n_as) {
+                group gp{};
+                while (e < n_as && gp.n < MAX_EXPERTS) {
+                    const int64_t first = expert_row_offsets[e];
+                    const int64_t last  = expert_row_offsets[e + 1];
+                    if (last > first) {
+                        gp.w[gp.n] = (const uint8_t *) src0_base + (size_t) e * expert_stride;
+                        gp.off[gp.n] = (int32_t) first;
+                        gp.off[gp.n + 1] = (int32_t) last;
+                        ++gp.n;
+                    }
+                    ++e;
+                }
+                if (gp.n == 0) continue;
+                const int32_t row_begin = gp.off[0];
+                const int32_t row_end = gp.off[gp.n];
+                std::vector<int32_t> batch_tokens;
+                for (int32_t r = row_begin; r < row_end; ++r) {
+                    const int32_t token = row_mapping_host[r].i2;
+                    if (token < 0 || token >= n_tokens) return false;
+                    if (!token_seen[(size_t) token]) {
+                        token_seen[(size_t) token] = 1;
+                        batch_tokens.push_back(token);
+                    }
+                }
+                for (int32_t token : batch_tokens) token_seen[(size_t) token] = 0;
+                std::sort(batch_tokens.begin(), batch_tokens.end());
+                if (local_group_tokens.size() > (size_t) INT32_MAX - batch_tokens.size()) return false;
+                local_reduce_batch batch{};
+                batch.experts = gp;
+                batch.row_begin = row_begin;
+                batch.row_end = row_end;
+                batch.token_begin = (int32_t) local_group_tokens.size();
+                batch.token_count = (int32_t) batch_tokens.size();
+                local_group_tokens.insert(local_group_tokens.end(), batch_tokens.begin(), batch_tokens.end());
+                local_batches.push_back(batch);
+                max_group_rows = std::max(max_group_rows, (size_t) (row_end - row_begin));
+            }
+            if (local_batches.empty() || max_group_rows == 0 ||
+                max_group_rows > SIZE_MAX / (size_t) M / sizeof(float) ||
+                max_group_rows * (size_t) M * sizeof(float) > 256u * 1024u * 1024u ||
+                local_group_tokens.empty() ||
+                local_group_tokens.size() > (256u * 1024u * 1024u) / sizeof(int32_t)) {
+                GGML_LOG_WARN("%s: local MoE reduction scratch exceeds limit or has invalid routing; using atomic path\n", __func__);
+                return false;
+            }
+            route_to_compact_dev.alloc((size_t) n_ids * (size_t) n_tokens);
+            group_products.alloc(max_group_rows * (size_t) M);
+            group_tokens_dev.alloc(local_group_tokens.size());
+            if (route_to_compact_dev.get() == nullptr || group_products.get() == nullptr || group_tokens_dev.get() == nullptr) {
+                GGML_LOG_WARN("%s: unable to allocate local MoE reduction scratch; using atomic path\n", __func__);
+                return false;
+            }
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(route_to_compact_dev.get(), route_to_compact_host.data(),
+                                                       route_to_compact_host.size() * sizeof(int32_t))));
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(group_tokens_dev.get(), local_group_tokens.data(),
+                                                       local_group_tokens.size() * sizeof(int32_t))));
+            // Both source vectors are temporary host storage. Complete these uploads before
+            // they leave scope; the subsequent device kernels remain asynchronous/in-order.
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+        }
+    }
     if constexpr (SUMMED) {
         GGML_ASSERT(row_mapping != nullptr && route_weights != nullptr && sum_dst != nullptr && n_ids > 0 && n_tokens > 0);
         SYCL_CHECK(CHECK_TRY_ERROR(stream->memset(sum_dst, 0, (size_t) M * (size_t) n_tokens * sizeof(float))));
@@ -1336,37 +1480,63 @@ static bool run_grouped(ggml_type src0_type, bool reordered, const void * src0_b
 
     // Batch at most 16 active experts per launch. The row offsets are absolute in the already
     // expert-sorted activation/output buffers; zero-count experts can be skipped without gaps.
-    int64_t e = 0;
-    while (e < n_as) {
-        group gp{};
-        while (e < n_as && gp.n < MAX_EXPERTS) {
-            const int64_t first = expert_row_offsets[e];
-            const int64_t last  = expert_row_offsets[e + 1];
-            if (last > first) {
-                gp.w[gp.n] = (const uint8_t *) src0_base + (size_t) e * expert_stride;
-                gp.off[gp.n] = (int32_t) first;
-                gp.off[gp.n + 1] = (int32_t) last;
-                ++gp.n;
+    const bool q5 = src0_type == GGML_TYPE_Q5_K;
+    if constexpr (LOCAL_REDUCE) {
+        for (const local_reduce_batch & batch : local_batches) {
+            group gp = batch.experts;
+            const int64_t group_rows = (int64_t) gp.off[gp.n] - gp.off[0];
+            const int64_t avg_rows = group_rows / gp.n;
+            if (avg_rows < 96) {
+                const int ntiles = fill_tiles<small_config>(gp);
+                if (q5) launch_layout<small_config, T, true, SUMMED, true>(q, gp, packed, group_products.get(), blocks, ntiles,
+                    (int) M, (int) K, reordered, row_mapping, route_weights, n_ids, sum_dst, batch.row_begin);
+                else    launch_layout<small_config, T, false, SUMMED, true>(q, gp, packed, group_products.get(), blocks, ntiles,
+                    (int) M, (int) K, reordered, row_mapping, route_weights, n_ids, sum_dst, batch.row_begin);
+            } else {
+                const int ntiles = fill_tiles<large_config>(gp);
+                if (q5) launch_layout<large_config, T, true, SUMMED, true>(q, gp, packed, group_products.get(), blocks, ntiles,
+                    (int) M, (int) K, reordered, row_mapping, route_weights, n_ids, sum_dst, batch.row_begin);
+                else    launch_layout<large_config, T, false, SUMMED, true>(q, gp, packed, group_products.get(), blocks, ntiles,
+                    (int) M, (int) K, reordered, row_mapping, route_weights, n_ids, sum_dst, batch.row_begin);
             }
-            ++e;
+            // One work-item owns a final output element and reduces this batch's route slots
+            // in registers. No global floating-point atomic is used in the local-reduction mode.
+            reduce_group_partials(q, group_products.get(), route_to_compact_dev.get(),
+                                  group_tokens_dev.get() + batch.token_begin, batch.token_count,
+                                  batch.row_begin, batch.row_end, route_weights, n_ids, (int) M, sum_dst);
         }
-        if (gp.n == 0) continue;
+    } else {
+        int64_t e = 0;
+        while (e < n_as) {
+            group gp{};
+            while (e < n_as && gp.n < MAX_EXPERTS) {
+                const int64_t first = expert_row_offsets[e];
+                const int64_t last  = expert_row_offsets[e + 1];
+                if (last > first) {
+                    gp.w[gp.n] = (const uint8_t *) src0_base + (size_t) e * expert_stride;
+                    gp.off[gp.n] = (int32_t) first;
+                    gp.off[gp.n + 1] = (int32_t) last;
+                    ++gp.n;
+                }
+                ++e;
+            }
+            if (gp.n == 0) continue;
 
-        const int64_t group_rows = (int64_t) gp.off[gp.n] - gp.off[0];
-        const int64_t avg_rows = group_rows / gp.n;
-        const bool q5 = src0_type == GGML_TYPE_Q5_K;
-        if (avg_rows < 96) {
-            const int ntiles = fill_tiles<small_config>(gp);
-            if (q5) launch_layout<small_config, T, true, SUMMED>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered,
-                row_mapping, route_weights, n_ids, sum_dst);
-            else    launch_layout<small_config, T, false, SUMMED>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered,
-                row_mapping, route_weights, n_ids, sum_dst);
-        } else {
-            const int ntiles = fill_tiles<large_config>(gp);
-            if (q5) launch_layout<large_config, T, true, SUMMED>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered,
-                row_mapping, route_weights, n_ids, sum_dst);
-            else    launch_layout<large_config, T, false, SUMMED>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered,
-                row_mapping, route_weights, n_ids, sum_dst);
+            const int64_t group_rows = (int64_t) gp.off[gp.n] - gp.off[0];
+            const int64_t avg_rows = group_rows / gp.n;
+            if (avg_rows < 96) {
+                const int ntiles = fill_tiles<small_config>(gp);
+                if (q5) launch_layout<small_config, T, true, SUMMED>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered,
+                    row_mapping, route_weights, n_ids, sum_dst);
+                else    launch_layout<small_config, T, false, SUMMED>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered,
+                    row_mapping, route_weights, n_ids, sum_dst);
+            } else {
+                const int ntiles = fill_tiles<large_config>(gp);
+                if (q5) launch_layout<large_config, T, true, SUMMED>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered,
+                    row_mapping, route_weights, n_ids, sum_dst);
+                else    launch_layout<large_config, T, false, SUMMED>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered,
+                    row_mapping, route_weights, n_ids, sum_dst);
+            }
         }
     }
     return true;
@@ -1385,6 +1555,16 @@ static bool enabled() {
         // build-time default, "0" disables, and a nonzero value enables.
         const bool value = e == nullptr ? default_enabled : std::atoi(e) != 0;
         GGML_LOG_INFO("%s: %d\n", "GGML_SYCL_MOE_XMXG_Q4K_Q5K", value ? 1 : 0);
+        return value;
+    }();
+    return value;
+}
+
+static bool local_reduce_enabled() {
+    static const bool value = [] {
+        const char * e = std::getenv("GGML_SYCL_MOE_DOWN_SUM_LOCAL");
+        const bool value = e != nullptr && std::atoi(e) != 0;
+        GGML_LOG_INFO("%s: %d\n", "GGML_SYCL_MOE_DOWN_SUM_LOCAL", value ? 1 : 0);
         return value;
     }();
     return value;
@@ -1446,6 +1626,7 @@ bool ggml_sycl_grouped_xmxg_q4k_q5k_sum(ggml_type src0_type, bool reordered, con
                                          size_t expert_stride, const float * src1, int32_t src1_prec,
                                          const int64_t * expert_row_offsets, int64_t n_as, int64_t M, int64_t K,
                                          int64_t total_rows, const mmid_row_mapping * row_mapping,
+                                         const mmid_row_mapping * row_mapping_host,
                                          const float * route_weights, int n_ids, int64_t n_tokens,
                                          float * sum_dst, ggml_sycl_pool & pool, dpct::queue_ptr stream) {
     if (!fg_xmxg::enabled() || (src0_type != GGML_TYPE_Q4_K && src0_type != GGML_TYPE_Q5_K) ||
@@ -1481,12 +1662,38 @@ bool ggml_sycl_grouped_xmxg_q4k_q5k_sum(ggml_type src0_type, bool reordered, con
     const int64_t valid_rows = expert_row_offsets[n_as];
     if (n_active == 0 || valid_rows <= n_active * 64 || valid_rows > total_rows) return false;
 
+    const bool use_local_reduce = fg_xmxg::local_reduce_enabled();
+    if (use_local_reduce && row_mapping_host == nullptr) {
+        GGML_LOG_WARN("SYCL MoE down sum: host route mapping unavailable; using atomic reduction\n");
+    }
     if (combo == 4) {
+        if (use_local_reduce && row_mapping_host != nullptr && fg_xmxg::run_grouped<sycl::half, true, true>(src0_type, reordered, src0_base, expert_stride,
+            src1, nullptr, expert_row_offsets, n_as, M, K, valid_rows, blocks, pool, stream,
+            row_mapping, route_weights, n_ids, n_tokens, sum_dst, row_mapping_host)) {
+            if (g_ggml_sycl_debug) {
+                GGML_LOG_INFO("SYCL MoE down sum: grouped partial local-reduction path active\n");
+            }
+            return true;
+        }
+        if (use_local_reduce) {
+            GGML_LOG_WARN("SYCL MoE down sum: local reduction unavailable; using atomic reduction\n");
+        }
         return fg_xmxg::run_grouped<sycl::half, true>(src0_type, reordered, src0_base, expert_stride,
             src1, nullptr, expert_row_offsets, n_as, M, K, valid_rows, blocks, pool, stream,
             row_mapping, route_weights, n_ids, n_tokens, sum_dst);
     }
     using bf16 = sycl::ext::oneapi::bfloat16;
+    if (use_local_reduce && row_mapping_host != nullptr && fg_xmxg::run_grouped<bf16, true, true>(src0_type, reordered, src0_base, expert_stride,
+        src1, nullptr, expert_row_offsets, n_as, M, K, valid_rows, blocks, pool, stream,
+        row_mapping, route_weights, n_ids, n_tokens, sum_dst, row_mapping_host)) {
+        if (g_ggml_sycl_debug) {
+            GGML_LOG_INFO("SYCL MoE down sum: grouped partial local-reduction path active\n");
+        }
+        return true;
+    }
+    if (use_local_reduce) {
+        GGML_LOG_WARN("SYCL MoE down sum: local reduction unavailable; using atomic reduction\n");
+    }
     return fg_xmxg::run_grouped<bf16, true>(src0_type, reordered, src0_base, expert_stride,
         src1, nullptr, expert_row_offsets, n_as, M, K, valid_rows, blocks, pool, stream,
         row_mapping, route_weights, n_ids, n_tokens, sum_dst);

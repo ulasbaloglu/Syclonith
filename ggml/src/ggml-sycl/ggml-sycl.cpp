@@ -6025,7 +6025,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                     src0->type, src0_reordered, src0_original, nb02,
                     (const float *) src1_contiguous.get(), ggml_sycl_src1_prec(dst),
                     expert_row_offsets.data(), n_as, ne01, ne10, n_routed_rows,
-                    dev_row_mapping.get(), (const float *) route_weights->data, (int) n_ids, ne12,
+                    dev_row_mapping.get(), routed_row_src.data(), (const float *) route_weights->data, (int) n_ids, ne12,
                     (float *) dst_original, ctx.pool(), stream);
             }
         }
