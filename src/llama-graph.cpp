@@ -2521,26 +2521,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    // With the prefill ring (GGML_CUDA_MOE_RING_PREFILL), a prompt's down projection weighted and
-    // summed in one node (ggml_mul_mat_id_sum, [n_embd, 1, n_tokens]): the [n_embd, n_expert_used, n_tokens] products,
-    // the weighting and the adds stay out of the graph (the grouped block sums them group by group). Above 1024 tokens
-    // (the hosted block's ceiling; up to it, the blocks and their fusions keep today's nodes)
-    // On by default (LLAMA_MOE_DOWN_SUM=0 keeps today's nodes). Its quality is theirs (KLD of 10 Nov., RX 7900 XT,
-    // 8 x 4096, EN / FR / code: against them 0.0241 / 0.0322 / 0.0057, below the fusions switched off, rounding only:
-    // 0.0283 / 0.0355 / 0.0064). With the QSA layer by slices (LLAMA_QSA_ATT_SLICE) the compute buffer borrowed at
-    // -ub 9536 goes from 2636 to 2180 MiB a graph; the prefill at 19k, replayed: 1850 - 1862 against 1802 - 1840 t/s
-    // (11 Nov., once the summed down's adds no longer landed 8 in a row on one cache line)
-    // Only with the ring, and above the hosted block's 1024 tokens: without the ring a block of up to 1024 tokens is the
-    // hosted block's, which writes the unsummed products (ten times the summed tensor: garbage on Windows, an illegal
-    // access on HIP with the ring off, #47), and a larger one is summed from products held in pool memory, outside the
-    // compute buffer the cache lends (977 MiB at -ub 9536: out of memory on a full card, #47)
-    static const bool down_sum = (!getenv("LLAMA_MOE_DOWN_SUM") || atoi(getenv("LLAMA_MOE_DOWN_SUM")) != 0) &&
-        getenv("GGML_CUDA_MOE_RING_PREFILL") && atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0;
-    // and for a packed layer only (its experts a row apart): the ring takes nothing else (#49)
-    // and not when only a part of the experts is in registered RAM (ggml_moe_cache.ring_usable: no ring then)
-    if (down_sum && n_tokens > 1024 && down_exps->nb[2] > down_exps->nb[1]*down_exps->ne[1] &&
-            (!ggml_moe_cache.ring_usable || ggml_moe_cache.ring_usable()) && !weight_before_ffn && !down_exps_b && !down_exps_s && arch != LLM_ARCH_MISTRAL4 &&
-            loras->empty() && hparams.n_expert_used(il) == (uint32_t) n_expert_used && n_expert_used > 1) {
+    // ggml_mul_mat_id_sum keeps the expert products, route weighting and reduction out of the
+    // graph. CUDA's ring-prefill path retains its existing constraints; SYCL has a separate,
+    // explicit opt-in for the direct Q4_K/Q5_K XMXG down-sum kernel.
+    static const bool down_sum_allowed = !getenv("LLAMA_MOE_DOWN_SUM") || atoi(getenv("LLAMA_MOE_DOWN_SUM")) != 0;
+    static const bool down_sum_cuda_ring = down_sum_allowed && getenv("GGML_CUDA_MOE_RING_PREFILL") &&
+        atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0;
+    static const bool down_sum_sycl = down_sum_allowed && getenv("GGML_SYCL_MOE_DOWN_SUM") &&
+        atoi(getenv("GGML_SYCL_MOE_DOWN_SUM")) > 0;
+    const bool down_sum_common = n_tokens > 1024 && !weight_before_ffn && !down_exps_b && !down_exps_s &&
+        arch != LLM_ARCH_MISTRAL4 && loras->empty() &&
+        hparams.n_expert_used(il) == (uint32_t) n_expert_used && n_expert_used > 1;
+    const bool down_sum_sycl_ok = down_sum_sycl && ggml_is_contiguous(down_exps) &&
+        (down_exps->type == GGML_TYPE_Q4_K || down_exps->type == GGML_TYPE_Q5_K) && ggml_is_contiguous(weights);
+    const bool down_sum_cuda_ok = down_sum_cuda_ring &&
+        down_exps->nb[2] > down_exps->nb[1]*down_exps->ne[1] &&
+        (!ggml_moe_cache.ring_usable || ggml_moe_cache.ring_usable());
+    if (down_sum_common && (down_sum_sycl_ok || down_sum_cuda_ok)) {
         experts = ggml_mul_mat_id_sum(ctx0, down_exps, cur, selected_experts, weights);   // [n_embd, 1, n_tokens]
         if (prec_policy) {
             prec_policy->apply(experts);

@@ -1162,11 +1162,12 @@ static int fill_tiles(group & gp) {
     return t;
 }
 
-template <typename T, bool REORDERED, bool Q5> class small_kernel;
-template <typename T, bool REORDERED, bool Q5> class large_kernel;
-template <class C, class Name, typename T, bool REORDERED, bool Q5>
+template <typename T, bool REORDERED, bool Q5, bool SUMMED> class small_kernel;
+template <typename T, bool REORDERED, bool Q5, bool SUMMED> class large_kernel;
+template <class C, class Name, typename T, bool REORDERED, bool Q5, bool SUMMED>
 static void launch(sycl::queue & q, const group & gp, const T * X, float * Y, int blocks,
-                   int ntiles, int N, int K) {
+                   int ntiles, int N, int K, const mmid_row_mapping * row_mapping,
+                   const float * route_weights, int n_ids, float * sum_dst) {
     constexpr int BM = C::BM, BN = C::BN, KS = C::KS, WG = C::WG, TN = SG;
     constexpr int LDA = KS + 8, LDB = KS + 8;
     const int nb = N / BN;
@@ -1183,7 +1184,10 @@ static void launch(sycl::queue & q, const group & gp, const T * X, float * Y, in
             const int m0 = (t - gp.tstart[e]) * BM;
             const int rows = sycl::min(BM, gp.off[e + 1] - gp.off[e] - m0);
             const T * Xe = X + ((size_t) gp.off[e] + m0) * K;
-            float * Ye = Y + ((size_t) gp.off[e] + m0) * N;
+            float * Ye = nullptr;
+            if constexpr (!SUMMED) {
+                Ye = Y + ((size_t) gp.off[e] + m0) * N;
+            }
             const uint8_t * w = gp.w[e];
             const int n0 = (int) it.get_group(1) * BN;
             const int lid = (int) it.get_local_id(1), sgid = lid / SG;
@@ -1233,7 +1237,31 @@ static void launch(sycl::queue & q, const group & gp, const T * X, float * Y, in
                 if (r >= rows) continue;
                 for (int j = 0; j < C::NT; ++j) {
                     const int c = n0 + sgn * C::NT * TN + j * TN;
-                    if (r + 8 <= rows) {
+                    if constexpr (SUMMED) {
+                        // The down projection is already weighted by its route coefficient here.
+                        // Store the 8x8 accumulator into per-subgroup SLM, then atomically add each
+                        // routed row into its token's final output. This avoids materializing the
+                        // [M, n_expert_used, n_tokens] product tensor.
+                        float * st = reinterpret_cast<float *>(pa) + sgid * 8 * TN;
+                        mx::joint_matrix_store(sg, acc[i][j],
+                            sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(st),
+                            TN, mx::layout::row_major);
+                        sycl::group_barrier(sg);
+                        const int lim = sycl::min(8, rows - r);
+                        const int ln = (int) sg.get_local_linear_id();
+                        for (int rr = 0; rr < lim; ++rr) {
+                            const int compact_row = gp.off[e] + m0 + r + rr;
+                            const mmid_row_mapping mapping = row_mapping[compact_row];
+                            const float weight = route_weights[(int64_t) mapping.i2 * n_ids + mapping.i1];
+                            const float value = st[rr * TN + ln] * weight;
+                            float * out = sum_dst + (int64_t) mapping.i2 * N + c + ln;
+                            sycl::atomic_ref<float, sycl::memory_order::relaxed,
+                                             sycl::memory_scope::device,
+                                             sycl::access::address_space::global_space> atom(*out);
+                            atom.fetch_add(value);
+                        }
+                        sycl::group_barrier(sg);
+                    } else if (r + 8 <= rows) {
                         mx::joint_matrix_store(sg, acc[i][j],
                             sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
                                 Ye + (size_t) r * N + c), N, mx::layout::row_major);
@@ -1253,28 +1281,36 @@ static void launch(sycl::queue & q, const group & gp, const T * X, float * Y, in
     });
 }
 
-template <class C, typename T, bool Q5>
+template <class C, typename T, bool Q5, bool SUMMED>
 static void launch_layout(sycl::queue & q, const group & gp, const T * X, float * Y, int blocks,
-                          int ntiles, int N, int K, bool reordered) {
+                          int ntiles, int N, int K, bool reordered,
+                          const mmid_row_mapping * row_mapping, const float * route_weights,
+                          int n_ids, float * sum_dst) {
     if (reordered) {
         if constexpr (std::is_same_v<C, small_config>) {
-            launch<C, small_kernel<T, true, Q5>, T, true, Q5>(q, gp, X, Y, blocks, ntiles, N, K);
+            launch<C, small_kernel<T, true, Q5, SUMMED>, T, true, Q5, SUMMED>(q, gp, X, Y, blocks, ntiles, N, K,
+                row_mapping, route_weights, n_ids, sum_dst);
         } else {
-            launch<C, large_kernel<T, true, Q5>, T, true, Q5>(q, gp, X, Y, blocks, ntiles, N, K);
+            launch<C, large_kernel<T, true, Q5, SUMMED>, T, true, Q5, SUMMED>(q, gp, X, Y, blocks, ntiles, N, K,
+                row_mapping, route_weights, n_ids, sum_dst);
         }
     } else {
         if constexpr (std::is_same_v<C, small_config>) {
-            launch<C, small_kernel<T, false, Q5>, T, false, Q5>(q, gp, X, Y, blocks, ntiles, N, K);
+            launch<C, small_kernel<T, false, Q5, SUMMED>, T, false, Q5, SUMMED>(q, gp, X, Y, blocks, ntiles, N, K,
+                row_mapping, route_weights, n_ids, sum_dst);
         } else {
-            launch<C, large_kernel<T, false, Q5>, T, false, Q5>(q, gp, X, Y, blocks, ntiles, N, K);
+            launch<C, large_kernel<T, false, Q5, SUMMED>, T, false, Q5, SUMMED>(q, gp, X, Y, blocks, ntiles, N, K,
+                row_mapping, route_weights, n_ids, sum_dst);
         }
     }
 }
-template <typename T>
+template <typename T, bool SUMMED>
 static bool run_grouped(ggml_type src0_type, bool reordered, const void * src0_base, size_t expert_stride,
                         const float * src1, float * dst, const int64_t * expert_row_offsets,
                         int64_t n_as, int64_t M, int64_t K, int64_t valid_rows,
-                        int blocks, ggml_sycl_pool & pool, dpct::queue_ptr stream) {
+                        int blocks, ggml_sycl_pool & pool, dpct::queue_ptr stream,
+                        const mmid_row_mapping * row_mapping, const float * route_weights,
+                        int n_ids, int64_t n_tokens, float * sum_dst) {
     const uint64_t elements64 = (uint64_t) valid_rows * (uint64_t) K;
     if (elements64 > SIZE_MAX / sizeof(T)) return false;
     const size_t elements = (size_t) elements64;
@@ -1286,6 +1322,10 @@ static bool run_grouped(ggml_type src0_type, bool reordered, const void * src0_b
     }
 
     sycl::queue & q = *stream;
+    if constexpr (SUMMED) {
+        GGML_ASSERT(row_mapping != nullptr && route_weights != nullptr && sum_dst != nullptr && n_ids > 0 && n_tokens > 0);
+        SYCL_CHECK(CHECK_TRY_ERROR(stream->memset(sum_dst, 0, (size_t) M * (size_t) n_tokens * sizeof(float))));
+    }
     T * packed = packed_x.get();
     // The engine's XMX kernel consumes half-width activations. Convert the routed rows once here,
     // rather than re-reading F32 and converting the same activation tile for every output-N tile.
@@ -1317,12 +1357,16 @@ static bool run_grouped(ggml_type src0_type, bool reordered, const void * src0_b
         const bool q5 = src0_type == GGML_TYPE_Q5_K;
         if (avg_rows < 96) {
             const int ntiles = fill_tiles<small_config>(gp);
-            if (q5) launch_layout<small_config, T, true>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered);
-            else    launch_layout<small_config, T, false>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered);
+            if (q5) launch_layout<small_config, T, true, SUMMED>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered,
+                row_mapping, route_weights, n_ids, sum_dst);
+            else    launch_layout<small_config, T, false, SUMMED>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered,
+                row_mapping, route_weights, n_ids, sum_dst);
         } else {
             const int ntiles = fill_tiles<large_config>(gp);
-            if (q5) launch_layout<large_config, T, true>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered);
-            else    launch_layout<large_config, T, false>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered);
+            if (q5) launch_layout<large_config, T, true, SUMMED>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered,
+                row_mapping, route_weights, n_ids, sum_dst);
+            else    launch_layout<large_config, T, false, SUMMED>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered,
+                row_mapping, route_weights, n_ids, sum_dst);
         }
     }
     return true;
@@ -1385,14 +1429,67 @@ bool ggml_sycl_grouped_xmxg_q4k_q5k(ggml_type src0_type, bool reordered, const v
     if (n_active == 0 || valid_rows <= n_active * 64 || valid_rows > total_rows) return false;
 
     if (combo == 4) {
-        return fg_xmxg::run_grouped<sycl::half>(src0_type, reordered, src0_base, expert_stride,
+        return fg_xmxg::run_grouped<sycl::half, false>(src0_type, reordered, src0_base, expert_stride,
                                                 src1, dst, expert_row_offsets, n_as, M, K,
-                                                valid_rows, blocks, pool, stream);
+                                                valid_rows, blocks, pool, stream, nullptr, nullptr, 0, 0, nullptr);
     }
     using bf16 = sycl::ext::oneapi::bfloat16;
-    return fg_xmxg::run_grouped<bf16>(src0_type, reordered, src0_base, expert_stride,
+    return fg_xmxg::run_grouped<bf16, false>(src0_type, reordered, src0_base, expert_stride,
                                       src1, dst, expert_row_offsets, n_as, M, K,
-                                      valid_rows, blocks, pool, stream);
+                                      valid_rows, blocks, pool, stream, nullptr, nullptr, 0, 0, nullptr);
+#endif
+}
+
+// Fused down-projection variant: route-weight each XMX accumulator tile and reduce it directly
+// into [n_embd, n_tokens], avoiding the intermediate [n_embd, top_k, n_tokens] product tensor.
+bool ggml_sycl_grouped_xmxg_q4k_q5k_sum(ggml_type src0_type, bool reordered, const void * src0_base,
+                                         size_t expert_stride, const float * src1, int32_t src1_prec,
+                                         const int64_t * expert_row_offsets, int64_t n_as, int64_t M, int64_t K,
+                                         int64_t total_rows, const mmid_row_mapping * row_mapping,
+                                         const float * route_weights, int n_ids, int64_t n_tokens,
+                                         float * sum_dst, ggml_sycl_pool & pool, dpct::queue_ptr stream) {
+    if (!fg_xmxg::enabled() || (src0_type != GGML_TYPE_Q4_K && src0_type != GGML_TYPE_Q5_K) ||
+        g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F32 ||
+        !ggml_sycl_xmx_gather_type_enabled(src0_type)) {
+        return false;
+    }
+    if (src0_base == nullptr || src1 == nullptr || expert_row_offsets == nullptr || row_mapping == nullptr ||
+        route_weights == nullptr || sum_dst == nullptr || n_ids <= 0 || n_tokens <= 0 ||
+        n_as <= 0 || n_as > INT32_MAX || M <= 0 || K <= 0 || M % 128 != 0 || K % QK_K != 0 ||
+        M > INT32_MAX || K > INT32_MAX || total_rows <= 0 || total_rows > INT32_MAX ||
+        (uint64_t) total_rows != (uint64_t) n_ids * (uint64_t) n_tokens ||
+        (uint64_t) M > SIZE_MAX / sizeof(float) / (uint64_t) n_tokens || expert_stride == 0 || !stream) {
+        return false;
+    }
+#if defined(GGML_SYCL_XMX_AOT_SG) && GGML_SYCL_XMX_AOT_SG != 8
+    return false;
+#else
+    const int combo = fg_pick_combo(stream, GGML_TYPE_F32, src1_prec);
+    if (combo != 4 && combo != 7) return false;
+
+    const size_t block_bytes = src0_type == GGML_TYPE_Q4_K ? sizeof(block_q4_K) : sizeof(block_q5_K);
+    if (expert_stride % block_bytes != 0 || expert_stride / block_bytes > INT32_MAX) return false;
+    const int blocks = (int) (expert_stride / block_bytes);
+    const uint64_t expected_blocks = (uint64_t) M * (uint64_t) (K / QK_K);
+    if ((uint64_t) blocks != expected_blocks || expert_row_offsets[0] != 0) return false;
+    int64_t n_active = 0;
+    for (int64_t e = 0; e < n_as; ++e) {
+        if (expert_row_offsets[e + 1] < expert_row_offsets[e]) return false;
+        n_active += expert_row_offsets[e + 1] > expert_row_offsets[e];
+        if (expert_row_offsets[e + 1] > INT32_MAX) return false;
+    }
+    const int64_t valid_rows = expert_row_offsets[n_as];
+    if (n_active == 0 || valid_rows <= n_active * 64 || valid_rows > total_rows) return false;
+
+    if (combo == 4) {
+        return fg_xmxg::run_grouped<sycl::half, true>(src0_type, reordered, src0_base, expert_stride,
+            src1, nullptr, expert_row_offsets, n_as, M, K, valid_rows, blocks, pool, stream,
+            row_mapping, route_weights, n_ids, n_tokens, sum_dst);
+    }
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    return fg_xmxg::run_grouped<bf16, true>(src0_type, reordered, src0_base, expert_stride,
+        src1, nullptr, expert_row_offsets, n_as, M, K, valid_rows, blocks, pool, stream,
+        row_mapping, route_weights, n_ids, n_tokens, sum_dst);
 #endif
 }
 
