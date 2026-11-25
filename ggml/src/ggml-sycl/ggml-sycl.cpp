@@ -5639,6 +5639,23 @@ __dpct_inline__ static void k_zero_dst_rows(
     }
 }
 
+// Correctness fallback for ggml_mul_mat_id_sum when the direct XMXG reduction is not eligible.
+// products is laid out as [M, n_ids, n_tokens], matching the CPU implementation's slot order.
+__dpct_inline__ static void k_mmid_sum_products(const float *__restrict__ products, const float *__restrict__ weights,
+                                                  float *__restrict__ dst, int64_t M, int64_t n_ids,
+                                                  sycl::id<1> id) {
+    const size_t flat = (size_t) id[0];
+    const int64_t token = (int64_t) (flat / (size_t) M);
+    const int64_t col = (int64_t) (flat % (size_t) M);
+    const float * token_products = products + (size_t) token * (size_t) n_ids * (size_t) M + (size_t) col;
+    const float * token_weights = weights + (size_t) token * (size_t) n_ids;
+    float sum = token_products[0] * token_weights[0];
+    for (int64_t slot = 1; slot < n_ids; ++slot) {
+        sum += token_products[(size_t) slot * (size_t) M] * token_weights[slot];
+    }
+    dst[flat] = sum;
+}
+
 // Maximum token batch handled by the per-token fused MUL_MAT_ID path.
 // Read once, matching the execution-path configuration.
 static int64_t ggml_sycl_mmid_small_batch_limit() {
@@ -5652,6 +5669,7 @@ static int64_t ggml_sycl_mmid_small_batch_limit() {
 
 // Returns true when ggml_sycl_mul_mat_id takes the fallback path that requires stream synchronization.
 static bool ggml_sycl_mul_mat_id_needs_sync(const ggml_tensor * dst) {
+    if (ggml_mul_mat_id_is_sum(dst)) return true;
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -5820,12 +5838,18 @@ static void mmid_counting_sort_rows(
 
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                  ggml_tensor *dst) try {
-    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
+    const bool is_sum = ggml_mul_mat_id_is_sum(dst);
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/is_sum ? 4 : 3);
     const ggml_tensor *src0 = dst->src[0];
     const ggml_tensor *src1 = dst->src[1];
     GGML_ASSERT(!ggml_backend_buffer_is_sycl_split(src0->buffer) && "mul_mat_id does not support split buffers");
 
     const ggml_tensor *ids = dst->src[2];
+    const ggml_tensor *route_weights = is_sum ? dst->src[3] : nullptr;
+    GGML_ASSERT(!is_sum || (route_weights != nullptr && route_weights->type == GGML_TYPE_F32 &&
+                            ggml_is_contiguous(route_weights) && route_weights->ne[0] == 1 &&
+                            route_weights->ne[1] == ids->ne[0] && route_weights->ne[2] == ids->ne[1] &&
+                            ggml_is_contiguous(dst) && dst->type == GGML_TYPE_F32));
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const queue_ptr stream = ctx.stream();
@@ -5833,7 +5857,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    if (ne12 == 1) {
+    if (ne12 == 1 && !is_sum) {
         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
             return;
         }
@@ -5845,7 +5869,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     // Off unless GGML_SYCL_MMID_SMALL_BATCH=N (max tokens) is set.
     {
         const int64_t mmid_small_batch = ggml_sycl_mmid_small_batch_limit();
-        if (ne12 > 1 && ne12 <= mmid_small_batch && ids->ne[1] == ne12) {
+        if (!is_sum && ne12 > 1 && ne12 <= mmid_small_batch && ids->ne[1] == ne12) {
             bool ok = true;
             for (int64_t t = 0; t < ne12 && ok; ++t) {
                 ggml_tensor src1_t = *src1;
@@ -5910,7 +5934,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     dst_row.ne[3] = 1;
     dst_row.nb[2] = nb1;
     dst_row.nb[3] = nb1;
-    if (ne12 == 1) {
+    if (ne12 == 1 && !is_sum) {
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t i02 = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
@@ -5937,11 +5961,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         }
     } else {
         const int64_t n_routed_rows = ids->ne[1] * n_ids;
+        // The VMM pool requires allocations to be released in strict reverse allocation
+        // order. Declare these RAII handles in the same order in which their buffers are
+        // allocated below (src1, row mapping, products, compact output).
         ggml_sycl_pool_alloc<char> src1_contiguous(ctx.pool(), sizeof(float)*n_routed_rows*ne10);
-        ggml_sycl_pool_alloc<char>  dst_contiguous(ctx.pool(), sizeof(float)*n_routed_rows*ne0);
+        ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool());
+        ggml_sycl_pool_alloc<char> dst_products(ctx.pool());
+        ggml_sycl_pool_alloc<char> dst_contiguous(ctx.pool());
 
         src1_row.data = src1_contiguous.get();
-        dst_row.data  =  dst_contiguous.get();
 
         // how many "owned" routed rows to pass to each expert
         std::vector<int64_t> expert_row_counts;
@@ -5949,59 +5977,103 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         std::vector<int64_t> expert_row_offsets;
         // the sources (slot/token pairs) of contiguous rows to guide k_copy_src1_to_contiguous
         std::vector<mmid_row_mapping> & routed_row_src = ctx.mmid_row_mapping_host;
-        // the slot/token pairs of the skipped slots, whose dst rows are zeroed
+        // the slot/token pairs of skipped slots, whose product rows must be zero in the sum fallback
         std::vector<mmid_row_mapping> skipped_row_dst;
 
         mmid_counting_sort_rows(ids, ids_host.data(), n_ids, n_as, n_routed_rows,
                                 expert_row_counts, expert_row_offsets, routed_row_src, skipped_row_dst);
 
         const int64_t n_valid_rows = (int64_t) routed_row_src.size();
-
-        ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
-        SYCL_CHECK(CHECK_TRY_ERROR(
-                stream->memcpy(dev_row_mapping.get(), routed_row_src.data(), n_valid_rows*sizeof(mmid_row_mapping))));
-
         const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
         assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
+
+        dev_row_mapping.alloc(n_routed_rows);
+        if (n_valid_rows > 0) {
+            SYCL_CHECK(CHECK_TRY_ERROR(
+                    stream->memcpy(dev_row_mapping.get(), routed_row_src.data(), n_valid_rows*sizeof(mmid_row_mapping))));
+
+            sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne10, max_work_group_size));
+            sycl::range<3> grid_dims(1, 1, n_valid_rows);
+            stream->submit([&](sycl::handler &cgh) {
+                char *__restrict__ src1_contiguous_get = src1_contiguous.get();
+                mmid_row_mapping *__restrict__ dev_row_mapping_get = dev_row_mapping.get();
+
+                cgh.parallel_for(
+                    sycl::nd_range<3>(grid_dims * block_dims, block_dims),
+                    [=](sycl::nd_item<3> item_ct1) {
+                        k_copy_src1_to_contiguous(src1_original, src1_contiguous_get,
+                                                  dev_row_mapping_get, ne11, ne10, nb11, nb12, item_ct1);
+                    });
+            });
+        }
+
+        // The optimized down-sum path writes each weighted XMX tile directly to the final
+        // [M, n_tokens] output. It does not allocate the much larger [M, top_k, n_tokens]
+        // product tensor. This is intentionally limited to contiguous Q4_K/Q5_K expert weights.
+        bool fused_sum = false;
+        if (is_sum && n_valid_rows > 0 && ggml_is_contiguous(src0) && ggml_is_contiguous(dst) &&
+            ggml_is_contiguous(route_weights) && src1->type == GGML_TYPE_F32 &&
+            dst->type == GGML_TYPE_F32 && nb11 == sizeof(float)*ne10) {
+            if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
+                ggml_sycl_xmx_gather_type_enabled(src0->type)) {
+                opt_for_reorder_id(&ctx, src0);
+            }
+            const bool src0_reordered = src0->extra &&
+                ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
+            if (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) {
+                fused_sum = ggml_sycl_grouped_xmxg_q4k_q5k_sum(
+                    src0->type, src0_reordered, src0_original, nb02,
+                    (const float *) src1_contiguous.get(), ggml_sycl_src1_prec(dst),
+                    expert_row_offsets.data(), n_as, ne01, ne10, n_routed_rows,
+                    dev_row_mapping.get(), (const float *) route_weights->data, (int) n_ids, ne12,
+                    (float *) dst_original, ctx.pool(), stream);
+            }
+        }
+        if (fused_sum) {
+            if (g_ggml_sycl_debug) {
+                GGML_LOG_INFO("SYCL MoE down sum: fused Q4_K/Q5_K XMX weighted-reduction path active\n");
+            }
+            return;
+        }
+
+        // Generic correctness path: compute compact expert products, scatter them to the
+        // logical [M, top_k, n_tokens] layout, then reduce in route-slot order like the CPU path.
+        GGML_ASSERT(ne0 > 0 && n_routed_rows > 0);
+        size_t product_nb1 = nb1;
+        size_t product_nb2 = nb2;
+        if (is_sum) {
+            GGML_ASSERT((uint64_t) n_routed_rows <= SIZE_MAX / sizeof(float) / (uint64_t) ne0);
+            product_nb1 = sizeof(float) * (size_t) ne0;
+            GGML_ASSERT((size_t) n_ids <= SIZE_MAX / product_nb1);
+            product_nb2 = product_nb1 * (size_t) n_ids;
+            GGML_ASSERT((size_t) ids->ne[1] <= SIZE_MAX / product_nb2);
+            const size_t product_bytes = product_nb2 * (size_t) ids->ne[1];
+            // dst_products is a byte allocation; alloc() takes a count of its element type (char).
+            dst_products.alloc(product_bytes);
+        }
+        const size_t compact_bytes = sizeof(float) * (size_t) std::max<int64_t>(1, n_valid_rows) * (size_t) ne0;
+        dst_contiguous.alloc(compact_bytes);
+        dst_row.data = dst_contiguous.get();
 
         if (!skipped_row_dst.empty()) {
             ggml_sycl_pool_alloc<mmid_row_mapping> dev_skipped(ctx.pool(), skipped_row_dst.size());
             SYCL_CHECK(CHECK_TRY_ERROR(
                     stream->memcpy(dev_skipped.get(), skipped_row_dst.data(), skipped_row_dst.size()*sizeof(mmid_row_mapping))));
 
+            char * zero_target = is_sum ? dst_products.get() : dst_original;
+            const size_t zero_nb1 = is_sum ? product_nb1 : nb1;
+            const size_t zero_nb2 = is_sum ? product_nb2 : nb2;
             sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne0, max_work_group_size));
             sycl::range<3> grid_dims(1, 1, skipped_row_dst.size());
             stream->submit([&](sycl::handler &cgh) {
-                mmid_row_mapping *__restrict dev_skipped_get = dev_skipped.get();
-
+                mmid_row_mapping *__restrict__ dev_skipped_get = dev_skipped.get();
                 cgh.parallel_for(
                     sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                     [=](sycl::nd_item<3> item_ct1) {
-                        k_zero_dst_rows(dst_original, dev_skipped_get, ne0, nb1, nb2, item_ct1);
+                        k_zero_dst_rows(zero_target, dev_skipped_get, ne0, zero_nb1, zero_nb2, item_ct1);
                     });
             });
             SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
-        }
-
-        if (n_valid_rows > 0) {
-            sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne10, max_work_group_size));
-            sycl::range<3> grid_dims(1, 1, n_valid_rows);
-            stream->submit([&](sycl::handler &cgh) {
-                char *__restrict src1_contiguous_get =
-                    src1_contiguous.get();
-                mmid_row_mapping *__restrict dev_row_mapping_get =
-                    dev_row_mapping.get();
-
-                cgh.parallel_for(
-                    sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-                    [=](sycl::nd_item<3> item_ct1) {
-                        k_copy_src1_to_contiguous(
-                            src1_original, src1_contiguous_get,
-                            dev_row_mapping_get,
-                            ne11, ne10, nb11, nb12,
-                            item_ct1);
-                    });
-            });
         }
 
         bool grouped = false;
@@ -6015,8 +6087,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             }
             const bool src0_reordered =
                 src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
-            // For large routed batches, try the engine-derived 64/128 x 128 XMX kernel before
-            // the existing narrow-tile grouped GEMM. It handles raw and SoA-reordered Q4_K/Q5_K.
             bool xmxg = false;
             if (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) {
                 xmxg = ggml_sycl_grouped_xmxg_q4k_q5k(
@@ -6075,20 +6145,31 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne0, max_work_group_size));
             sycl::range<3> grid_dims(1, 1, n_valid_rows);
             stream->submit([&](sycl::handler &cgh) {
-                const char *__restrict dst_contiguous_get =
-                    dst_contiguous.get();
-                const mmid_row_mapping *__restrict dev_row_mapping_get =
-                    dev_row_mapping.get();
-
+                const char *__restrict__ dst_contiguous_get = dst_contiguous.get();
+                const mmid_row_mapping *__restrict__ dev_row_mapping_get = dev_row_mapping.get();
+                char * scatter_dst = is_sum ? dst_products.get() : dst_original;
+                const size_t scatter_nb1 = is_sum ? product_nb1 : nb1;
+                const size_t scatter_nb2 = is_sum ? product_nb2 : nb2;
                 cgh.parallel_for(
                     sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                     [=](sycl::nd_item<3> item_ct1) {
-                        k_copy_dst_from_contiguous(dst_original,
-                                                   dst_contiguous_get,
-                                                   dev_row_mapping_get,
-                                                   ne0, nb1, nb2, item_ct1);
+                        k_copy_dst_from_contiguous(scatter_dst, dst_contiguous_get,
+                                                   dev_row_mapping_get, ne0, scatter_nb1, scatter_nb2, item_ct1);
                     });
             });
+        }
+
+        if (is_sum) {
+            const float * products = (const float *) dst_products.get();
+            const float * weights = (const float *) route_weights->data;
+            float * sum_dst = (float *) dst_original;
+            const size_t total = (size_t) ne0 * (size_t) ne12;
+            stream->parallel_for(sycl::range<1>(total), [=](sycl::id<1> id) {
+                k_mmid_sum_products(products, weights, sum_dst, ne0, n_ids, id);
+            });
+            if (g_ggml_sycl_debug) {
+                GGML_LOG_INFO("SYCL MoE down sum: generic weighted-reduction fallback active\n");
+            }
         }
     }
 }
