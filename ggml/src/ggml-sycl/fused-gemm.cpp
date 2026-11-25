@@ -1332,7 +1332,14 @@ static bool run_grouped(ggml_type src0_type, bool reordered, const void * src0_b
 static bool enabled() {
     static const bool value = [] {
         const char * e = std::getenv("GGML_SYCL_MOE_XMXG_Q4K_Q5K");
-        const bool value = e != nullptr && std::atoi(e) != 0;
+#if defined(GGML_SYCL_MOE_XMXG_Q4K_Q5K_DEFAULT)
+        constexpr bool default_enabled = true;
+#else
+        constexpr bool default_enabled = false;
+#endif
+        // The environment variable is an explicit override: unset uses the
+        // build-time default, "0" disables, and a nonzero value enables.
+        const bool value = e == nullptr ? default_enabled : std::atoi(e) != 0;
         GGML_LOG_INFO("%s: %d\n", "GGML_SYCL_MOE_XMXG_Q4K_Q5K", value ? 1 : 0);
         return value;
     }();

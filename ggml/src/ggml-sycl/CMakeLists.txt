@@ -280,4 +280,13 @@ if (GGML_SYCL_DEVICE_ARCH)
     endforeach()
     message(STATUS "GGML_SYCL_DEVICE_ARCH: XMX dequant-GEMM sub-group size ${_ggml_sycl_xmx_sg} (0 = off)")
     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_XMX_AOT_SG=${_ggml_sycl_xmx_sg})
+
+    # The engine-derived large-row Q4_K/Q5_K grouped XMX kernel showed a
+    # positive result in initial ARL-H subgroup-8 measurements. Enable it by
+    # default only for that exact AOT target; other compatible subgroup-8
+    # targets can opt in after validation. GGML_SYCL_MOE_XMXG_Q4K_Q5K=0 disables it.
+    if (_ggml_sycl_archs STREQUAL "arl-h" AND _ggml_sycl_xmx_sg EQUAL 8)
+        target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_MOE_XMXG_Q4K_Q5K_DEFAULT=1)
+        message(STATUS "GGML_SYCL_DEVICE_ARCH=arl-h: Q4_K/Q5_K grouped XMX MoE prefill enabled by default")
+    endif()
 endif()

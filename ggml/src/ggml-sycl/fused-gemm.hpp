@@ -80,7 +80,9 @@ bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, const void * src0, const 
 // dst[n*M + m] = sum_k dequant(src0_e)[m*K + k] * src1[n*K + k]
 // Returns false when the case is not handled (type, layout, device, precision, or shape).
 // Large-row Q4_K/Q5_K MoE XMX kernel adapted from the engine's grouped expert XMX implementation.
-// Opt-in via GGML_SYCL_MOE_XMXG_Q4K_Q5K=1; raw and reorder_qw() SoA weight layouts are supported.
+// Default enabled for the ARL-H AOT build; override with GGML_SYCL_MOE_XMXG_Q4K_Q5K=0.
+// Other compatible subgroup-8 builds remain opt-in via GGML_SYCL_MOE_XMXG_Q4K_Q5K=1.
+// Raw and reorder_qw() SoA weight layouts are supported.
 bool ggml_sycl_grouped_xmxg_q4k_q5k(ggml_type src0_type, bool reordered, const void * src0_base,
                                      size_t expert_stride, const float * src1, int32_t src1_prec, float * dst,
                                      const int64_t * expert_row_offsets, int64_t n_as, int64_t M, int64_t K,
