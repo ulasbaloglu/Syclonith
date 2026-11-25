@@ -2527,8 +2527,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     static const bool down_sum_allowed = !getenv("LLAMA_MOE_DOWN_SUM") || atoi(getenv("LLAMA_MOE_DOWN_SUM")) != 0;
     static const bool down_sum_cuda_ring = down_sum_allowed && getenv("GGML_CUDA_MOE_RING_PREFILL") &&
         atoi(getenv("GGML_CUDA_MOE_RING_PREFILL")) > 0;
-    static const bool down_sum_sycl = down_sum_allowed && getenv("GGML_SYCL_MOE_DOWN_SUM") &&
-        atoi(getenv("GGML_SYCL_MOE_DOWN_SUM")) > 0;
+#if defined(LLAMA_SYCL_MOE_DOWN_SUM_DEFAULT)
+    static constexpr bool down_sum_sycl_default = true;
+#else
+    static constexpr bool down_sum_sycl_default = false;
+#endif
+    // On validated ARL-H builds, use the fused weighted XMX down-sum by default.
+    // GGML_SYCL_MOE_DOWN_SUM is an explicit override: unset uses the build default,
+    // "0" disables it, and a nonzero value enables it. LLAMA_MOE_DOWN_SUM=0 remains
+    // the global opt-out for both CUDA and SYCL graph fusions.
+    static const bool down_sum_sycl_setting = [] {
+        const char * e = getenv("GGML_SYCL_MOE_DOWN_SUM");
+        return e != nullptr ? atoi(e) > 0 : down_sum_sycl_default;
+    }();
+    static const bool down_sum_sycl = down_sum_allowed && down_sum_sycl_setting;
     const bool down_sum_common = n_tokens > 1024 && !weight_before_ffn && !down_exps_b && !down_exps_s &&
         arch != LLM_ARCH_MISTRAL4 && loras->empty() &&
         hparams.n_expert_used(il) == (uint32_t) n_expert_used && n_expert_used > 1;

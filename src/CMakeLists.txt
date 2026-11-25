@@ -70,6 +70,17 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+# The grouped Q4_K/Q5_K weighted MoE down-sum was measured on the ARL-H
+# subgroup-8 XMX path. Default-enable its graph selection only for that build;
+# GGML_SYCL_MOE_DOWN_SUM=0 remains an explicit runtime opt-out.
+if (GGML_SYCL)
+    string(TOLOWER "${GGML_SYCL_DEVICE_ARCH}" _llama_sycl_device_arch)
+    if (_llama_sycl_device_arch STREQUAL "arl-h")
+        target_compile_definitions(llama PRIVATE LLAMA_SYCL_MOE_DOWN_SUM_DEFAULT=1)
+        message(STATUS "SYCL ARL-H: fused Q4_K/Q5_K MoE down-sum enabled by default")
+    endif()
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
