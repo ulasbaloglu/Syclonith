@@ -1,10 +1,13 @@
 #include "fused-gemm.hpp"
 
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -1062,6 +1065,335 @@ static bool fg_grouped_run(ggml_type src0_type, bool reordered, const void * src
                                                                        (int) M, Npad, (int) K, n_tiles, groups_m,
                                                                        stream);
     });
+}
+
+// Large-batch Q4_K/Q5_K MoE prefill path adapted from the engine's xmxg::iq_xmx_grouped
+// implementation (engine/sycl/src/kernels/cuda/iq_kernels.dp.cpp).
+// Unlike the small grouped path above,
+// this uses 64/128-row x 128-output tiles and decodes the GGUF weights directly into SLM. It is
+// intended for the large-row regime where the existing grouped path deliberately declines and
+// the caller otherwise launches a separate library GEMM for each expert.
+namespace fg_xmxg {
+#if !defined(GGML_SYCL_XMX_AOT_SG) || GGML_SYCL_XMX_AOT_SG == 8
+constexpr int SG = 8;
+constexpr int MAX_EXPERTS = 16;
+struct group {
+    const uint8_t * w[MAX_EXPERTS];
+    int32_t off[MAX_EXPERTS + 1];
+    int32_t tstart[MAX_EXPERTS + 1];
+    int32_t n;
+};
+template <int SGM_, int SGN_, int MT_, int NT_> struct config {
+    static constexpr int SGM = SGM_, SGN = SGN_, MT = MT_, NT = NT_;
+    static constexpr int KS = 32, BM = SGM * MT * 8, BN = SGN * NT * SG, WG = SGM * SGN * SG;
+};
+using small_config = config<2, 8, 4, 2>; // 64 x 128, 16 subgroups of 8
+using large_config = config<4, 4, 4, 4>; // 128 x 128, 16 subgroups of 8
+
+static inline void scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+template <typename T, bool REORDERED, bool Q5>
+static inline void decode8(const uint8_t * w, int64_t blocks, int64_t ibs, int ib32, int sub, T * dst) {
+    const uint8_t * qs;
+    const uint8_t * qh = nullptr;
+    const uint8_t * scales;
+    sycl::half2 dm;
+    if constexpr (Q5) {
+        if constexpr (REORDERED) {
+            const size_t ql_bytes = (size_t) blocks * (QK_K / 2);
+            const size_t qh_bytes = (size_t) blocks * (QK_K / 8);
+            qs = w + (size_t) ibs * (QK_K / 2);
+            qh = w + ql_bytes + (size_t) ibs * (QK_K / 8);
+            scales = w + ql_bytes + qh_bytes + (size_t) ibs * K_SCALE_SIZE;
+            dm = ((const sycl::half2 *) (w + ql_bytes + qh_bytes + (size_t) blocks * K_SCALE_SIZE))[ibs];
+        } else {
+            const block_q5_K * b = (const block_q5_K *) w + ibs;
+            qs = b->qs;
+            qh = b->qh;
+            scales = b->scales;
+            dm = b->dm;
+        }
+    } else {
+        if constexpr (REORDERED) {
+            const size_t q_bytes = (size_t) blocks * (QK_K / 2);
+            qs = w + (size_t) ibs * (QK_K / 2);
+            scales = w + q_bytes + (size_t) ibs * K_SCALE_SIZE;
+            dm = ((const sycl::half2 *) (w + q_bytes + (size_t) blocks * K_SCALE_SIZE))[ibs];
+        } else {
+            const block_q4_K * b = (const block_q4_K *) w + ibs;
+            qs = b->qs;
+            scales = b->scales;
+            dm = b->dm;
+        }
+    }
+    uint8_t sc, m;
+    scale_min_k4(ib32, scales, sc, m);
+    const float d = (float) dm[0] * sc;
+    const float min = (float) dm[1] * m;
+    const uint8_t * ql = qs + 32 * (ib32 >> 1) + 8 * sub;
+    const uint8_t * qh8 = nullptr;
+    if constexpr (Q5) qh8 = qh + 8 * sub;
+    const uint8_t hm = (uint8_t) (1u << ib32);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        int q = (ib32 & 1) ? (ql[j] >> 4) : (ql[j] & 0x0f);
+        if constexpr (Q5) q |= (qh8[j] & hm) ? 16 : 0;
+        dst[j] = (T) (d * q - min);
+    }
+}
+
+template <class C>
+static int fill_tiles(group & gp) {
+    int t = 0;
+    for (int i = 0; i < gp.n; ++i) {
+        gp.tstart[i] = t;
+        const int rows = gp.off[i + 1] - gp.off[i];
+        t += (rows + C::BM - 1) / C::BM;
+    }
+    gp.tstart[gp.n] = t;
+    return t;
+}
+
+template <typename T, bool REORDERED, bool Q5> class small_kernel;
+template <typename T, bool REORDERED, bool Q5> class large_kernel;
+template <class C, class Name, typename T, bool REORDERED, bool Q5>
+static void launch(sycl::queue & q, const group & gp, const T * X, float * Y, int blocks,
+                   int ntiles, int N, int K) {
+    constexpr int BM = C::BM, BN = C::BN, KS = C::KS, WG = C::WG, TN = SG;
+    constexpr int LDA = KS + 8, LDB = KS + 8;
+    const int nb = N / BN;
+    auto props = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::intel::experimental::grf_size<256>};
+    q.submit([&](sycl::handler & h) {
+        sycl::local_accessor<T, 1> sa(BM * LDA, h), sb(BN * LDB, h);
+        h.parallel_for<Name>(sycl::nd_range<2>({(size_t) ntiles, (size_t) nb * WG}, {1, (size_t) WG}), props,
+                             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG)]] {
+            auto sg = it.get_sub_group();
+            const int t = (int) it.get_group(0);
+            int e = 0;
+            while (e + 1 < gp.n && t >= gp.tstart[e + 1]) ++e;
+            const int m0 = (t - gp.tstart[e]) * BM;
+            const int rows = sycl::min(BM, gp.off[e + 1] - gp.off[e] - m0);
+            const T * Xe = X + ((size_t) gp.off[e] + m0) * K;
+            float * Ye = Y + ((size_t) gp.off[e] + m0) * N;
+            const uint8_t * w = gp.w[e];
+            const int n0 = (int) it.get_group(1) * BN;
+            const int lid = (int) it.get_local_id(1), sgid = lid / SG;
+            const int sgm = sgid / C::SGN, sgn = sgid % C::SGN;
+            mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, 8, TN> acc[C::MT][C::NT];
+            for (int i = 0; i < C::MT; ++i)
+                for (int j = 0; j < C::NT; ++j) mx::joint_matrix_fill(sg, acc[i][j], 0.0f);
+            T * pa = sa.template get_multi_ptr<sycl::access::decorated::no>().get();
+            T * pb = sb.template get_multi_ptr<sycl::access::decorated::no>().get();
+            for (int k0 = 0; k0 < K; k0 += KS) {
+                constexpr int VA = BM * KS / 8;
+                for (int v = lid; v < VA; v += WG) {
+                    const int r = v / (KS / 8), c = (v % (KS / 8)) * 8;
+                    if (r < rows) {
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) pa[(size_t) r * LDA + c + j] = Xe[(size_t) r * K + k0 + c + j];
+                    } else {
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) pa[(size_t) r * LDA + c + j] = (T) 0.0f;
+                    }
+                }
+                // Decode each output row's next 32 quantized values directly into the B tile.
+                for (int v = lid; v < BN * 4; v += WG) {
+                    const int r = v >> 2, sub = v & 3, nr = n0 + r;
+                    const int64_t flat = (int64_t) nr * K + k0;
+                    const int64_t ibs = flat >> 8;
+                    const int ib32 = (int) ((flat & 255) >> 5);
+                    decode8<T, REORDERED, Q5>(w, blocks, ibs, ib32, sub, pb + (size_t) r * LDB + 8 * sub);
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int kk = 0; kk < KS; kk += 16) {
+                    mx::joint_matrix<sycl::sub_group, T, mx::use::a, 8, 16, mx::layout::row_major> am[C::MT];
+                    mx::joint_matrix<sycl::sub_group, T, mx::use::b, 16, TN, mx::layout::col_major> bm[C::NT];
+                    for (int i = 0; i < C::MT; ++i)
+                        mx::joint_matrix_load(sg, am[i], sa.template get_multi_ptr<sycl::access::decorated::no>() +
+                                                   (sgm * C::MT * 8 + i * 8) * LDA + kk, LDA);
+                    for (int j = 0; j < C::NT; ++j)
+                        mx::joint_matrix_load(sg, bm[j], sb.template get_multi_ptr<sycl::access::decorated::no>() +
+                                                   (sgn * C::NT * TN + j * TN) * LDB + kk, LDB);
+                    for (int i = 0; i < C::MT; ++i)
+                        for (int j = 0; j < C::NT; ++j) mx::joint_matrix_mad(sg, acc[i][j], am[i], bm[j], acc[i][j]);
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+            }
+            for (int i = 0; i < C::MT; ++i) {
+                const int r = sgm * C::MT * 8 + i * 8;
+                if (r >= rows) continue;
+                for (int j = 0; j < C::NT; ++j) {
+                    const int c = n0 + sgn * C::NT * TN + j * TN;
+                    if (r + 8 <= rows) {
+                        mx::joint_matrix_store(sg, acc[i][j],
+                            sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                                Ye + (size_t) r * N + c), N, mx::layout::row_major);
+                    } else {
+                        float * st = reinterpret_cast<float *>(pa) + sgid * 8 * TN;
+                        mx::joint_matrix_store(sg, acc[i][j],
+                            sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(st),
+                            TN, mx::layout::row_major);
+                        sycl::group_barrier(sg);
+                        const int lim = rows - r, ln = (int) sg.get_local_linear_id();
+                        for (int rr = 0; rr < lim; ++rr) Ye[(size_t) (r + rr) * N + c + ln] = st[rr * TN + ln];
+                        sycl::group_barrier(sg);
+                    }
+                }
+            }
+        });
+    });
+}
+
+template <class C, typename T, bool Q5>
+static void launch_layout(sycl::queue & q, const group & gp, const T * X, float * Y, int blocks,
+                          int ntiles, int N, int K, bool reordered) {
+    if (reordered) {
+        if constexpr (std::is_same_v<C, small_config>) {
+            launch<C, small_kernel<T, true, Q5>, T, true, Q5>(q, gp, X, Y, blocks, ntiles, N, K);
+        } else {
+            launch<C, large_kernel<T, true, Q5>, T, true, Q5>(q, gp, X, Y, blocks, ntiles, N, K);
+        }
+    } else {
+        if constexpr (std::is_same_v<C, small_config>) {
+            launch<C, small_kernel<T, false, Q5>, T, false, Q5>(q, gp, X, Y, blocks, ntiles, N, K);
+        } else {
+            launch<C, large_kernel<T, false, Q5>, T, false, Q5>(q, gp, X, Y, blocks, ntiles, N, K);
+        }
+    }
+}
+template <typename T>
+static bool run_grouped(ggml_type src0_type, bool reordered, const void * src0_base, size_t expert_stride,
+                        const float * src1, float * dst, const int64_t * expert_row_offsets,
+                        int64_t n_as, int64_t M, int64_t K, int64_t valid_rows,
+                        int blocks, ggml_sycl_pool & pool, dpct::queue_ptr stream) {
+    const uint64_t elements64 = (uint64_t) valid_rows * (uint64_t) K;
+    if (elements64 > SIZE_MAX / sizeof(T)) return false;
+    const size_t elements = (size_t) elements64;
+    ggml_sycl_pool_alloc<T> packed_x(pool, elements);
+    if (packed_x.get() == nullptr) {
+        GGML_LOG_WARN("%s: unable to allocate %zu bytes for packed MoE activations; using fallback\n",
+                      __func__, elements * sizeof(T));
+        return false;
+    }
+
+    sycl::queue & q = *stream;
+    T * packed = packed_x.get();
+    // The engine's XMX kernel consumes half-width activations. Convert the routed rows once here,
+    // rather than re-reading F32 and converting the same activation tile for every output-N tile.
+    q.parallel_for(sycl::range<1>(elements), [=](sycl::id<1> id) {
+        const size_t i = (size_t) id[0];
+        packed[i] = (T) src1[i];
+    });
+
+    // Batch at most 16 active experts per launch. The row offsets are absolute in the already
+    // expert-sorted activation/output buffers; zero-count experts can be skipped without gaps.
+    int64_t e = 0;
+    while (e < n_as) {
+        group gp{};
+        while (e < n_as && gp.n < MAX_EXPERTS) {
+            const int64_t first = expert_row_offsets[e];
+            const int64_t last  = expert_row_offsets[e + 1];
+            if (last > first) {
+                gp.w[gp.n] = (const uint8_t *) src0_base + (size_t) e * expert_stride;
+                gp.off[gp.n] = (int32_t) first;
+                gp.off[gp.n + 1] = (int32_t) last;
+                ++gp.n;
+            }
+            ++e;
+        }
+        if (gp.n == 0) continue;
+
+        const int64_t group_rows = (int64_t) gp.off[gp.n] - gp.off[0];
+        const int64_t avg_rows = group_rows / gp.n;
+        const bool q5 = src0_type == GGML_TYPE_Q5_K;
+        if (avg_rows < 96) {
+            const int ntiles = fill_tiles<small_config>(gp);
+            if (q5) launch_layout<small_config, T, true>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered);
+            else    launch_layout<small_config, T, false>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered);
+        } else {
+            const int ntiles = fill_tiles<large_config>(gp);
+            if (q5) launch_layout<large_config, T, true>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered);
+            else    launch_layout<large_config, T, false>(q, gp, packed, dst, blocks, ntiles, (int) M, (int) K, reordered);
+        }
+    }
+    return true;
+}
+#endif // GGML_SYCL_XMX_AOT_SG == 8
+
+static bool enabled() {
+    static const bool value = [] {
+        const char * e = std::getenv("GGML_SYCL_MOE_XMXG_Q4K_Q5K");
+#if defined(GGML_SYCL_MOE_XMXG_Q4K_Q5K_DEFAULT)
+        constexpr bool default_enabled = true;
+#else
+        constexpr bool default_enabled = false;
+#endif
+        // The environment variable is an explicit override: unset uses the
+        // build-time default, "0" disables, and a nonzero value enables.
+        const bool value = e == nullptr ? default_enabled : std::atoi(e) != 0;
+        GGML_LOG_INFO("%s: %d\n", "GGML_SYCL_MOE_XMXG_Q4K_Q5K", value ? 1 : 0);
+        return value;
+    }();
+    return value;
+}
+} // namespace fg_xmxg
+
+bool ggml_sycl_grouped_xmxg_q4k_q5k(ggml_type src0_type, bool reordered, const void * src0_base,
+                                     size_t expert_stride, const float * src1, int32_t src1_prec, float * dst,
+                                     const int64_t * expert_row_offsets, int64_t n_as, int64_t M, int64_t K,
+                                     int64_t total_rows, ggml_sycl_pool & pool, dpct::queue_ptr stream) {
+    if (!fg_xmxg::enabled() || (src0_type != GGML_TYPE_Q4_K && src0_type != GGML_TYPE_Q5_K) ||
+        g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F32 ||
+        !ggml_sycl_xmx_gather_type_enabled(src0_type)) {
+        return false;
+    }
+    if (src0_base == nullptr || src1 == nullptr || dst == nullptr || expert_row_offsets == nullptr ||
+        n_as <= 0 || n_as > INT32_MAX || M <= 0 || K <= 0 || M % 128 != 0 || K % QK_K != 0 ||
+        M > INT32_MAX || K > INT32_MAX || total_rows <= 0 || total_rows > INT32_MAX || expert_stride == 0 || !stream) {
+        return false;
+    }
+#if defined(GGML_SYCL_XMX_AOT_SG) && GGML_SYCL_XMX_AOT_SG != 8
+    return false;
+#else
+    // This kernel uses the engine's 8-lane 8x8x16 XMX tile. Support both F16 (combo 4) and
+    // BF16 (combo 7), respecting the same precision request as the existing fused-GEMM path.
+    const int combo = fg_pick_combo(stream, GGML_TYPE_F32, src1_prec);
+    if (combo != 4 && combo != 7) return false;
+
+    const size_t block_bytes = src0_type == GGML_TYPE_Q4_K ? sizeof(block_q4_K) : sizeof(block_q5_K);
+    if (expert_stride % block_bytes != 0 || expert_stride / block_bytes > INT32_MAX) return false;
+    const int blocks = (int) (expert_stride / block_bytes);
+    const uint64_t expected_blocks = (uint64_t) M * (uint64_t) (K / QK_K);
+    if ((uint64_t) blocks != expected_blocks) return false;
+    if (expert_row_offsets[0] != 0) return false;
+    int64_t n_active = 0;
+    for (int64_t e = 0; e < n_as; ++e) {
+        if (expert_row_offsets[e + 1] < expert_row_offsets[e]) return false;
+        n_active += expert_row_offsets[e + 1] > expert_row_offsets[e];
+        if (expert_row_offsets[e + 1] > INT32_MAX) return false;
+    }
+    const int64_t valid_rows = expert_row_offsets[n_as];
+    if (n_active == 0 || valid_rows <= n_active * 64 || valid_rows > total_rows) return false;
+
+    if (combo == 4) {
+        return fg_xmxg::run_grouped<sycl::half>(src0_type, reordered, src0_base, expert_stride,
+                                                src1, dst, expert_row_offsets, n_as, M, K,
+                                                valid_rows, blocks, pool, stream);
+    }
+    using bf16 = sycl::ext::oneapi::bfloat16;
+    return fg_xmxg::run_grouped<bf16>(src0_type, reordered, src0_base, expert_stride,
+                                      src1, dst, expert_row_offsets, n_as, M, K,
+                                      valid_rows, blocks, pool, stream);
+#endif
 }
 
 bool ggml_sycl_grouped_dequant_gemm(ggml_type src0_type, bool reordered, const void * src0_base, size_t expert_stride,

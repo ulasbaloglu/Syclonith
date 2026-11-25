@@ -6015,11 +6015,31 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             }
             const bool src0_reordered =
                 src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
-            grouped = ggml_sycl_grouped_dequant_gemm(src0->type, src0_reordered, src0_original, nb02,
-                                                     (const float *) src1_contiguous.get(), ggml_sycl_src1_prec(dst),
-                                                     (float *) dst_contiguous.get(),
-                                                     expert_row_offsets.data(), n_as, ne01, ne10, n_routed_rows,
-                                                     ctx.mmid_tile_schedule_host, ctx.pool(), stream);
+            // For large routed batches, try the engine-derived 64/128 x 128 XMX kernel before
+            // the existing narrow-tile grouped GEMM. It handles raw and SoA-reordered Q4_K/Q5_K.
+            bool xmxg = false;
+            if (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) {
+                xmxg = ggml_sycl_grouped_xmxg_q4k_q5k(
+                    src0->type, src0_reordered, src0_original, nb02,
+                    (const float *) src1_contiguous.get(), ggml_sycl_src1_prec(dst),
+                    (float *) dst_contiguous.get(), expert_row_offsets.data(), n_as,
+                    ne01, ne10, n_routed_rows, ctx.pool(), stream);
+            }
+            grouped = xmxg;
+            if (!grouped) {
+                grouped = ggml_sycl_grouped_dequant_gemm(src0->type, src0_reordered, src0_original, nb02,
+                                                         (const float *) src1_contiguous.get(), ggml_sycl_src1_prec(dst),
+                                                         (float *) dst_contiguous.get(),
+                                                         expert_row_offsets.data(), n_as, ne01, ne10, n_routed_rows,
+                                                         ctx.mmid_tile_schedule_host, ctx.pool(), stream);
+            }
+            if (g_ggml_sycl_debug &&
+                (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K)) {
+                GGML_LOG_INFO("SYCL MoE prefill: %s XMX path %s for %s\n",
+                              xmxg ? "large-tile grouped" : "existing grouped dequant-GEMM",
+                              grouped ? "active" : "unavailable; using per-expert fallback",
+                              src0->type == GGML_TYPE_Q4_K ? "Q4_K" : "Q5_K");
+            }
         }
 
         for (int64_t i02 = 0; i02 < n_as && !grouped; i02++) {
