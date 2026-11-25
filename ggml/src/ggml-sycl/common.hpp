@@ -71,8 +71,6 @@ extern int g_ggml_sycl_enable_optimize;
 extern int g_ggml_sycl_enable_fusion;
 extern int g_ggml_sycl_enable_esimd;
 extern int g_ggml_sycl_mmvq_wide;
-extern int g_ggml_sycl_mmvq_wide_k;
-extern int g_ggml_sycl_mmvq_wide_k_rpw;
 extern int g_ggml_sycl_enable_xmx_esimd;
 extern int g_ggml_sycl_xmx_max_cols;
 extern int g_ggml_sycl_xmx_glu_max_cols;
