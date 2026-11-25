@@ -5961,9 +5961,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         }
     } else {
         const int64_t n_routed_rows = ids->ne[1] * n_ids;
+        // The VMM pool requires allocations to be released in strict reverse allocation
+        // order. Declare these RAII handles in the same order in which their buffers are
+        // allocated below (src1, row mapping, products, compact output).
         ggml_sycl_pool_alloc<char> src1_contiguous(ctx.pool(), sizeof(float)*n_routed_rows*ne10);
-        ggml_sycl_pool_alloc<char> dst_contiguous(ctx.pool());
+        ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool());
         ggml_sycl_pool_alloc<char> dst_products(ctx.pool());
+        ggml_sycl_pool_alloc<char> dst_contiguous(ctx.pool());
 
         src1_row.data = src1_contiguous.get();
 
@@ -5983,7 +5987,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
         assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
 
-        ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
+        dev_row_mapping.alloc(n_routed_rows);
         if (n_valid_rows > 0) {
             SYCL_CHECK(CHECK_TRY_ERROR(
                     stream->memcpy(dev_row_mapping.get(), routed_row_src.data(), n_valid_rows*sizeof(mmid_row_mapping))));
