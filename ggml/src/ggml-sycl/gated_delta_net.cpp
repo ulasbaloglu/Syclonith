@@ -324,7 +324,9 @@ static void launch_gated_delta_net_sg16_prefill(
 static bool ggml_sycl_gdn_sg16_prefill_requested() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_SYCL_GDN_SG16_PREFILL");
-        return value != nullptr && std::atoi(value) != 0;
+        // Default on for devices that pass the SG16 capability and shape checks.
+        // Set GGML_SYCL_GDN_SG16_PREFILL=0 to force the established recurrence.
+        return value == nullptr || std::atoi(value) != 0;
     }();
     return enabled;
 }
