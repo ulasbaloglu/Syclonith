@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <vector>
+#include <utility>
 
 #include "fattn-onednn.hpp"
 #include "fattn-tile.hpp"
@@ -123,6 +124,14 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
 #include "dnnl.hpp"
 #include "dnnl_sycl.hpp"
 #include "oneapi/dnnl/dnnl_graph.hpp"   // graph API lives only under oneapi/dnnl/, not at the include root
+#include "dnnl_version.h"
+
+// Graph host_scalar support is available from oneDNN 3.10.
+#if DNNL_VERSION_MAJOR > 3 || (DNNL_VERSION_MAJOR == 3 && DNNL_VERSION_MINOR >= 10)
+#define GGML_SYCL_DNNL_GRAPH_HOST_SCALAR 1
+#else
+#define GGML_SYCL_DNNL_GRAPH_HOST_SCALAR 0
+#endif
 
 using namespace dnnl;
 using namespace dnnl::graph;
@@ -163,6 +172,7 @@ struct sdpa_partition {
     std::vector<logical_tensor> ins;
     logical_tensor              out;
     size_t id_q = 0, id_k = 0, id_v = 0, id_scale = 0, id_mask = 0;
+    bool   use_host_scale = false;
     bool   ok = false;
 };
 
@@ -174,7 +184,8 @@ static thread_local const char * ggml_sycl_sdpa_stage = "not started";
 // Build + compile the contiguous-input GQA SDPA graph (MatMul->Divide->Add->SoftMax->MatMul), f32 out.
 // Mirrors the hardware-verified scratch/onednn_sdpa_probe.cpp build_gqa (partitions=1, sdp_primitive_kernel_t).
 static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int seq, int d,
-                                 const std::array<int64_t, 5> & k_str, const std::array<int64_t, 5> & v_str) try {
+                                 const std::array<int64_t, 5> & k_str, const std::array<int64_t, 5> & v_str,
+                                 bool use_host_scale) try {
     using ltype = logical_tensor::layout_type;
     using dt    = logical_tensor::data_type;
     using ldims = logical_tensor::dims;
@@ -193,7 +204,15 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
     bmm1.set_attr<bool>(op::attr::transpose_b, true);          // key is [.., seq, d]
     bmm1.add_inputs({query, key}); bmm1.add_outputs({score});
 
-    auto scale  = logical_tensor(id++, t,  sc,   ltype::strided);
+    logical_tensor scale;
+#if GGML_SYCL_DNNL_GRAPH_HOST_SCALAR
+    if (use_host_scale) {
+        scale = logical_tensor(id++, t, ldims{}, ltype::undef, logical_tensor::property_type::host_scalar);
+    } else
+#endif
+    {
+        scale = logical_tensor(id++, t, sc, ltype::strided);
+    }
     auto scaled = logical_tensor(id++, fi, s_sz, ltype::strided);
     auto sdiv   = op(id++, op::kind::Divide, "scale_div");     // score / (1/kq_scale) == score * kq_scale
     sdiv.add_inputs({score, scale}); sdiv.add_outputs({scaled});
@@ -232,6 +251,7 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
     E.out      = E.cp.query_logical_tensor(E.out.get_id());
     E.id_q     = query.get_id(); E.id_k = key.get_id(); E.id_v = value.get_id();
     E.id_scale = scale.get_id(); E.id_mask = mask.get_id();
+    E.use_host_scale = use_host_scale;
     E.ok       = true;
     return E;
 }
@@ -271,6 +291,11 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     dpct::queue_ptr stream = ctx.stream();
     dnnl::engine    eng    = ctx.engine_dnnl(stream);
     dnnl::stream    strm   = ctx.stream_dnnl(stream);
+#if GGML_SYCL_DNNL_GRAPH_HOST_SCALAR
+    const bool use_host_scale = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_HOST_SCALE", 0) != 0;
+#else
+    const bool use_host_scale = false;
+#endif
 
     const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
 
@@ -366,22 +391,11 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     }
 
     ggml_sycl_sdpa_stage = "scale preparation";
-    // divide-by-(1/scale) reproduces ggml's score *= kq_scale on the proven probe graph.
-    //
-    // The scale must not be uploaded with an async memcpy from a stack local: on the in-order
-    // queue that copy waits behind the K/V staging kernels, and once those take long enough
-    // (n_kv >= ~26k on B70) the host frame is recycled before the copy runs, feeding the SDPA a
-    // garbage scale (output collapses to a repeated token). Write the scalar from a kernel
-    // instead -- the value is captured into the command, so no host memory has to outlive the
-    // call, and the enqueue stays async.
-    const sycl::half scale_h = (sycl::half) (1.0f / kq_scale);
+    // Keep the scalar alive through compiled_partition::execute(). The Graph host_scalar
+    // input avoids the per-call device scalar write kernel when enabled.
+    sycl::half scale_h = (sycl::half) (1.0f / kq_scale);
     std::optional<ggml_sycl_pool_alloc<sycl::half>> scbuf;
-    sycl::half * scale_dev = (sycl::half *) extra.scale_buffer_ptr;
-    if (!scale_dev) {
-        scbuf.emplace(ctx.pool(), 1);
-        scale_dev = scbuf->get();
-    }
-    stream->single_task([=]() { *scale_dev = scale_h; });
+    sycl::half * scale_dev = nullptr;
 
     // f16 contiguous SDPA out [mb,H,q,d]
     std::optional<ggml_sycl_pool_alloc<sycl::half>> outf_pool;
@@ -403,10 +417,11 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     // The cache is process-global, while engine_dnnl() is owned by each backend
     // context. Include the native engine handle so a partition cannot be reused
     // with a different backend context's engine on the same SYCL device.
-    snprintf(keyb, sizeof(keyb), "%p:%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld",
+    snprintf(keyb, sizeof(keyb), "%p:%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%d",
              static_cast<void *>(eng.get()), ggml_sycl_get_device(), (long long) H, (long long) Hkv,
              (long long) q, (long long) seq, (long long) d, (long long) k_str[0], (long long) k_str[1],
-             (long long) k_str[3], (long long) v_str[0], (long long) v_str[1], (long long) v_str[3]);
+             (long long) k_str[3], (long long) v_str[0], (long long) v_str[1], (long long) v_str[3],
+             (int) use_host_scale);
 
     sdpa_partition * E_ptr = nullptr;
 
@@ -416,8 +431,15 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         auto it = cache.find(keyb);
 
         if (it == cache.end()) {
-            it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, k_str, v_str))
-                     .first;
+            sdpa_partition built = build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d,
+                                              k_str, v_str, use_host_scale);
+            if (!built.ok && use_host_scale) {
+                GGML_LOG_WARN("%s: oneDNN Graph host_scalar scale is unsupported for this SDPA shape; "
+                              "retrying with the device-scalar graph\n", __func__);
+                built = build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d,
+                                   k_str, v_str, false);
+            }
+            it = cache.emplace(keyb, std::move(built)).first;
         }
 
         E_ptr = &it->second;
@@ -431,6 +453,16 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         return;
     }
 
+    // Prepare a device scalar only when the compiled graph uses the legacy device input.
+    if (!E.use_host_scale) {
+        scale_dev = (sycl::half *) extra.scale_buffer_ptr;
+        if (!scale_dev) {
+            scbuf.emplace(ctx.pool(), 1);
+            scale_dev = scbuf->get();
+        }
+        stream->single_task([=]() { *scale_dev = scale_h; });
+    }
+
     auto id2ptr = [&](size_t r) -> void * {
         if (r == E.id_q)     return Qf_ptr;
         if (r == E.id_k)     return K_ptr;
@@ -442,7 +474,11 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     std::vector<tensor> ti;
     ti.reserve(E.ins.size());
     for (auto & lt : E.ins) {
-        ti.emplace_back(lt, eng, id2ptr(lt.get_id()));
+        if (E.use_host_scale && lt.get_id() == E.id_scale) {
+            ti.emplace_back(tensor::make_scalar_tensor(lt, (void *) &scale_h));
+        } else {
+            ti.emplace_back(lt, eng, id2ptr(lt.get_id()));
+        }
     }
     tensor to(E.out, eng, outf_ptr);
     ggml_sycl_sdpa_stage = "compiled partition execute";
