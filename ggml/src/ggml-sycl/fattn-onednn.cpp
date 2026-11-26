@@ -158,93 +158,6 @@ static void permute_sdpa_out_sycl(const sycl::half * out, float * dst,
     });
 }
 
-
-// Specialised data movement for Qwen-style GQA on the 265H:
-// D=256, H=16, Hkv=2 (8 query heads per KV head).
-// Four rows are handled by each 256-work-item work-group. Each subgroup
-// walks a contiguous 64-element slice of the head dimension, and each work-item
-// converts four elements. This avoids per-element 64-bit div/mod in the generic
-// strided converter. The scale scalar is written by the first work-item so the
-// separate single_task launch is removed.
-static void q_to_f16_gqa256_sycl(const ggml_tensor * Q, sycl::half * dst,
-                                 sycl::half * scale_dev, sycl::half scale_h,
-                                 dpct::queue_ptr stream) {
-    constexpr size_t D = 256;
-    constexpr size_t ROWS_PER_WG = 4;
-    constexpr size_t COLS_PER_WG = 64;
-
-    const size_t H = (size_t) Q->ne[2];
-    const size_t q = (size_t) Q->ne[1];
-    const size_t rows = H * q;
-    const size_t row_groups = (rows + ROWS_PER_WG - 1) / ROWS_PER_WG;
-    const char * src = (const char *) Q->data;
-    const size_t nb1 = Q->nb[1];
-    const size_t nb2 = Q->nb[2];
-
-    stream->parallel_for(
-        sycl::nd_range<2>(
-            sycl::range<2>(row_groups * ROWS_PER_WG, COLS_PER_WG),
-            sycl::range<2>(ROWS_PER_WG, COLS_PER_WG)),
-        [=](sycl::nd_item<2> item) {
-            const size_t row = (size_t) item.get_group(0) * ROWS_PER_WG +
-                               (size_t) item.get_local_id(0);
-            const size_t lane = (size_t) item.get_local_id(1);
-
-            if (row < rows) {
-                const size_t head = row / q;
-                const size_t token = row - head * q;
-                const float * src_row = (const float *) (src + token * nb1 + head * nb2);
-                const size_t dst_row = row * D;
-#pragma unroll
-                for (size_t part = 0; part < D / COLS_PER_WG; ++part) {
-                    const size_t col = lane + part * COLS_PER_WG;
-                    dst[dst_row + col] = (sycl::half) src_row[col];
-                }
-            }
-
-            if (row == 0 && lane == 0) {
-                *scale_dev = scale_h;
-            }
-        });
-}
-
-// oneDNN output rows are [head][token][D]; ggml expects [token][head][D].
-// The same row-tiled mapping performs the F16 -> F32 conversion and transpose
-// with contiguous reads and contiguous writes along D.
-static void permute_sdpa_out_gqa256_sycl(const sycl::half * out, float * dst,
-                                         int64_t H, int64_t q,
-                                         dpct::queue_ptr stream) {
-    constexpr size_t D = 256;
-    constexpr size_t ROWS_PER_WG = 4;
-    constexpr size_t COLS_PER_WG = 64;
-
-    const size_t heads = (size_t) H;
-    const size_t tokens = (size_t) q;
-    const size_t rows = heads * tokens;
-    const size_t row_groups = (rows + ROWS_PER_WG - 1) / ROWS_PER_WG;
-
-    stream->parallel_for(
-        sycl::nd_range<2>(
-            sycl::range<2>(row_groups * ROWS_PER_WG, COLS_PER_WG),
-            sycl::range<2>(ROWS_PER_WG, COLS_PER_WG)),
-        [=](sycl::nd_item<2> item) {
-            const size_t src_row = (size_t) item.get_group(0) * ROWS_PER_WG +
-                                   (size_t) item.get_local_id(0);
-            const size_t lane = (size_t) item.get_local_id(1);
-
-            if (src_row < rows) {
-                const size_t head = src_row / tokens;
-                const size_t token = src_row - head * tokens;
-                const size_t dst_row = token * heads + head;
-#pragma unroll
-                for (size_t part = 0; part < D / COLS_PER_WG; ++part) {
-                    const size_t col = lane + part * COLS_PER_WG;
-                    dst[dst_row * D + col] = (float) out[src_row * D + col];
-                }
-            }
-        });
-}
-
 struct sdpa_partition {
     compiled_partition          cp;
     std::vector<logical_tensor> ins;
@@ -342,14 +255,6 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     const int64_t q   = Q->ne[1];   // n_tok
     const int64_t mb  = Q->ne[3];   // batch (== 1, gated)
 
-    // Keep this specialised data-movement path opt-in until benchmarked on the
-    // target device. It is valid only for the D=256, 16-Q-head / 2-KV-head shape.
-    static const bool fast_gqa256_enabled =
-        ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_GQA256_FAST", 0) != 0;
-    const bool fast_gqa256 = fast_gqa256_enabled &&
-        d == 256 && H == 16 && Hkv == 2 && mb == 1 &&
-        Q->type == GGML_TYPE_F32 && Q->nb[0] == sizeof(float);
-
     snprintf(ggml_sycl_sdpa_diag, sizeof(ggml_sycl_sdpa_diag),
              "Q=[%lld,%lld,%lld,%lld]/%s K=[%lld,%lld,%lld,%lld]/%s "
              "V=[%lld,%lld,%lld,%lld]/%s mask=%s",
@@ -377,10 +282,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         Qf_pool.emplace(ctx.pool(), (size_t) H * q * d);
         Qf_ptr = Qf_pool->get();
     }
-    if (!fast_gqa256) {
-        cont_to_f16_sycl<float>((const char *) Q->data, Qf_ptr, d, q, H, mb,
-                                Q->nb[1], Q->nb[2], Q->nb[3], stream);
-    }
+    cont_to_f16_sycl<float>((const char *) Q->data, Qf_ptr, d, q, H, mb, Q->nb[1], Q->nb[2], Q->nb[3], stream);
 
     // K/V: bind the f16 cache in place. llama.cpp permutes it to [token][head][dim], so its head
     // plane is strided rather than dense, which is what an explicit stride vector expresses.
@@ -479,11 +381,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         scbuf.emplace(ctx.pool(), 1);
         scale_dev = scbuf->get();
     }
-    if (fast_gqa256) {
-        q_to_f16_gqa256_sycl(Q, Qf_ptr, scale_dev, scale_h, stream);
-    } else {
-        stream->single_task([=]() { *scale_dev = scale_h; });
-    }
+    stream->single_task([=]() { *scale_dev = scale_h; });
 
     // f16 contiguous SDPA out [mb,H,q,d]
     std::optional<ggml_sycl_pool_alloc<sycl::half>> outf_pool;
@@ -551,11 +449,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     E.cp.execute(strm, ti, {to});
 
     ggml_sycl_sdpa_stage = "output permutation";
-    if (fast_gqa256) {
-        permute_sdpa_out_gqa256_sycl(outf_ptr, (float *) dst->data, H, q, stream);
-    } else {
-        permute_sdpa_out_sycl(outf_ptr, (float *) dst->data, mb, H, q, d, stream);
-    }
+    permute_sdpa_out_sycl(outf_ptr, (float *) dst->data, mb, H, q, d, stream);
     // Single device needs no sync: the dnnl stream wraps this same in-order queue, so the SDPA
     // serializes with the staging kernels before it and the permute/pool reuse after it. The
     // garbage output formerly blamed on the missing sync here was the scale use-after-return
