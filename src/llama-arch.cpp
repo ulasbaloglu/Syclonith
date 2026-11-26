@@ -403,8 +403,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_BLOCK_SIZE,       "%s.block_size"       },
     { LLM_KV_DFLASH_CONV_KERNEL_SIZE, "%s.conv_kernel_size" },
     { LLM_KV_DFLASH_CONV_GROUP_SIZE,  "%s.conv_group_size"  },
-    { LLM_KV_DFLASH_SELECTOR_RANK,    "%s.selector_rank"    },
-    { LLM_KV_DFLASH_SELECTOR_TOP_K,   "%s.selector_top_k"   },
+    { LLM_KV_DFLASH_SELECTOR_RANK,                     "%s.selector_rank"                        },
+    { LLM_KV_DFLASH_SELECTOR_TOP_K,                    "%s.selector_top_k"                       },
+    { LLM_KV_DFLASH_SELECTOR_SOFTCAP_AFTER_CORRECTION, "%s.selector_softcap_after_correction" },
 
     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
     // sentence-transformers dense modules feature dims

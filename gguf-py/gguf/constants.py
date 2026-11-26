@@ -171,6 +171,7 @@ class Keys:
         CONV_GROUP_SIZE                   = "{arch}.conv_group_size"
         SELECTOR_RANK                     = "{arch}.selector_rank"
         SELECTOR_TOP_K                    = "{arch}.selector_top_k"
+        SELECTOR_SOFTCAP_AFTER_CORRECTION = "{arch}.selector_softcap_after_correction"
         SAMPLE_FROM_ANCHOR                = "{arch}.sample_from_anchor"
         HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
@@ -5577,6 +5578,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.D2T,
     ],
     MODEL_ARCH.DFLASH: [
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
         MODEL_TENSOR.ATTN_POST_NORM,
         MODEL_TENSOR.FFN_POST_NORM,
         MODEL_TENSOR.LAYER_OUT_SCALE,
