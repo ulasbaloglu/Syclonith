@@ -207,7 +207,7 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
     logical_tensor scale;
 #if GGML_SYCL_DNNL_GRAPH_HOST_SCALAR
     if (use_host_scale) {
-        scale = logical_tensor(id++, t, ldims{}, ltype::undef, logical_tensor::property_type::host_scalar);
+        scale = logical_tensor(id++, fi, ldims{}, ltype::undef, logical_tensor::property_type::host_scalar);
     } else
 #endif
     {
@@ -393,7 +393,10 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     ggml_sycl_sdpa_stage = "scale preparation";
     // Keep the scalar alive through compiled_partition::execute(). The Graph host_scalar
     // input avoids the per-call device scalar write kernel when enabled.
-    sycl::half scale_h = (sycl::half) (1.0f / kq_scale);
+    const sycl::half scale_h = (sycl::half) (1.0f / kq_scale);
+    // Graph host_scalar only accepts F32/S32/S64; promote the already-rounded F16
+    // value so host and device scalar paths use exactly the same numerical scale.
+    const float scale_host = (float) scale_h;
     std::optional<ggml_sycl_pool_alloc<sycl::half>> scbuf;
     sycl::half * scale_dev = nullptr;
 
@@ -434,7 +437,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
             sdpa_partition built = build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d,
                                               k_str, v_str, use_host_scale);
             if (!built.ok && use_host_scale) {
-                GGML_LOG_WARN("%s: oneDNN Graph host_scalar scale is unsupported for this SDPA shape; "
+                GGML_LOG_WARN("%s: oneDNN Graph host_scalar graph build failed; "
                               "retrying with the device-scalar graph\n", __func__);
                 built = build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d,
                                    k_str, v_str, false);
@@ -475,7 +478,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     ti.reserve(E.ins.size());
     for (auto & lt : E.ins) {
         if (E.use_host_scale && lt.get_id() == E.id_scale) {
-            ti.emplace_back(tensor::make_scalar_tensor(lt, (void *) &scale_h));
+            ti.emplace_back(tensor::make_scalar_tensor(lt, (void *) &scale_host));
         } else {
             ti.emplace_back(lt, eng, id2ptr(lt.get_id()));
         }
