@@ -277,6 +277,7 @@ struct llama_hparams {
     uint32_t dflash_conv_group_size  = 0;
     uint32_t dflash_selector_rank    = 0;
     uint32_t dflash_selector_top_k   = 0;
+    bool     dflash_softcap_post     = false; // DFlash2 softcaps selector scores after correction.
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;

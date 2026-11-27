@@ -33,6 +33,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_TOP_K,   hparams.dflash_selector_top_k,   false);
+    ml.get_key(LLM_KV_DFLASH_SELECTOR_SOFTCAP_AFTER_CORRECTION, hparams.dflash_softcap_post, false);
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
@@ -111,6 +112,7 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
 
     tok_embd        = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,       "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    tok_norm        = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD_NORM,  "weight", 0), { n_embd }, TENSOR_NOT_REQUIRED);
 
     // reduced draft vocab (optional): d2t maps draft rows to target token ids
     int64_t n_vocab_draft = n_vocab;
@@ -531,6 +533,10 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
         }
         ggml_tensor * unary_bcast = ggml_reshape_4d(ctx0, unary_run, top_k, 1, n_pos, n_blocks);
         score = ggml_add(ctx0, score, ggml_repeat(ctx0, unary_bcast, score));
+        if (hparams.dflash_softcap_post && hparams.f_final_logit_softcapping > 0.0f) {
+            const float cap = hparams.f_final_logit_softcapping;
+            score = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, score, 1.0f / cap)), cap);
+        }
 
         ggml_tensor * row = ggml_concat(ctx0,
                 ggml_cast(ctx0, cand_run, GGML_TYPE_F32),
@@ -692,6 +698,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     ggml_tensor * inp_tokens = inp->tokens;
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    if (model.tok_norm) {
+        inpL = build_norm(inpL, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
+    }
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
@@ -817,7 +826,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         if (hparams.f_logit_scale != 0.0f) {
             cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
         }
-        if (hparams.f_final_logit_softcapping > 0.0f) {
+        if (hparams.f_final_logit_softcapping > 0.0f && !hparams.dflash_softcap_post) {
             cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
             cur = ggml_tanh(ctx0, cur);
             cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
