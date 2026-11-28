@@ -7385,7 +7385,7 @@ static void test_inkling2_media_blocks() {
         common_chat_msg msg;
         msg.role = "user";
         for (const auto & text : parts) {
-            msg.content_parts.push_back({ /* .type = */ text == M ? "media_marker" : "text", /* .text = */ text, /* .name = */ "" });
+            msg.content_parts.push_back({ /* .type = */ text == M ? "media_marker" : "text", /* .text = */ text });
         }
         common_chat_templates_inputs inputs;
         inputs.messages = { msg };
