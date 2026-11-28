@@ -129,7 +129,11 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     float logit_softcap = 0.0f;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // The grouped tile/vector layouts share one mask pointer across the Q
+    // heads in a GQA group.  A per-head mask must instead be handled one Q
+    // head at a time (or by MKL FA, which has explicit head strides).
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && mask->ne[2] == 1 &&
+        max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
@@ -157,7 +161,21 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         V->ne[0] == 512 && gqa_ratio == 20 &&
         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
 
-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
+    // MKL FA supports per-Q-head masks.  It also supports attention sinks:
+    // the online-softmax state is initialized with the sink logit and a
+    // denominator contribution of one, while the value accumulator starts
+    // at zero.  Keep the mask layout checks explicit because the kernel uses
+    // row/head/batch strides directly.
+    const bool mkl_mask_shape_ok = mask &&
+        mask->type == GGML_TYPE_F16 &&
+        mask->ne[0] >= K->ne[1] && mask->ne[1] >= Q->ne[1] &&
+        mask->ne[2] > 0 && Q->ne[2] % mask->ne[2] == 0 &&
+        mask->ne[3] > 0 && Q->ne[3] % mask->ne[3] == 0;
+    const bool mkl_sinks_shape_ok = !sinks ||
+        (sinks->type == GGML_TYPE_F32 && sinks->ne[0] == Q->ne[2] &&
+         ggml_is_contiguous(sinks));
+
+    if (g_ggml_sycl_enable_mkl_fa == 1 && mkl_mask_shape_ok && mkl_sinks_shape_ok && gqa_ratio >= 2 &&
         (standard_shape || glm_mla_shape) &&
         Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
         max_bias == 0.0f && logit_softcap == 0.0f &&
@@ -242,7 +260,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
     }
 
-    if (mask && mask->ne[2] != 1) {
+    if (mask && (mask->ne[2] <= 0 || Q->ne[2] % mask->ne[2] != 0)) {
         return BEST_FATTN_KERNEL_NONE;
     }
 

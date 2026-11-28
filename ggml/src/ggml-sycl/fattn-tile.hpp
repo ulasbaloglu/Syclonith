@@ -731,7 +731,13 @@ static void flash_attn_tile(const char *  Q,
     const sycl::half2 * V_h2 =
         (const sycl::half2 *) (V + nb23 * sequence + nb22 * (head0 / gqa_ratio));  // K and V have same shape
 
-    const sycl::half * maskh = mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33)) : nullptr;
+    // For a per-Q-head mask, this work-group owns one Q head when ncols2=1.
+    // The dispatch gate disables GQA head grouping for such masks, so the
+    // head offset is unambiguous here.  A singleton mask head remains shared.
+    const int mask_head = (ne32 > 1) ? (head0 % ne32) : 0;
+    const sycl::half * maskh = mask
+        ? (const sycl::half *) (mask + nb33 * (sequence % ne33) + nb32 * mask_head)
+        : nullptr;
 
     const int stride_K2   = nb11 / sizeof(sycl::half2);
     const int stride_V2   = nb21 / sizeof(sycl::half2);
@@ -1169,7 +1175,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
     //const bool nvidia = GGML_SYCL_CC_IS_NVIDIA(ggml_sycl_info().devices[ggml_sycl_get_device()].cc);
     const int gqa_limit = gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
-    const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    // GQA grouping shares a mask pointer across the grouped Q heads.  Keep
+    // it for broadcast masks, but process heads independently when the mask
+    // carries a distinct relative-position bias for each Q head.
+    const bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f &&
+        Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     if constexpr (DV == 512) {
         if (use_gqa_opt && gqa_ratio % 16 == 0) {

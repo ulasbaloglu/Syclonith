@@ -77,13 +77,15 @@ static void mkl_fa_pack_q_fp16(
     }
 }
 
-// Zero-initialize the online softmax state arrays.
-// KQ_max → -inf, KQ_sum → 0, VKQ_accum → 0.
+// Initialize the online softmax state arrays. Without a sink:
+// KQ_max → -inf, KQ_sum → 0, VKQ_accum → 0. With a sink, seed the
+// denominator with exp(sink) and leave the value numerator at zero.
 // Merged into one kernel to avoid per-array launch overhead.
 static void mkl_fa_init_softmax_state(
     dpct::queue_ptr stream,
     float * kmax, float * ksum, float * vacc,
-    int n_query_rows, int DV, int64_t wg_size) {
+    int n_query_rows, int n_queries, int kvh_base_head,
+    const float * sinks, int DV, int64_t wg_size) {
 
     const float    neg_inf   = -1e30f;
     const int64_t  n_maxsum  = n_query_rows;
@@ -96,8 +98,17 @@ static void mkl_fa_init_softmax_state(
             [=](sycl::nd_item<1> item) {
                 int64_t i = item.get_global_id(0);
                 if (i < n_maxsum) {
-                    kmax[i] = neg_inf;
-                    ksum[i] = 0.0f;
+                    if (sinks) {
+                        // Each packed row corresponds to one Q head inside
+                        // this KV head's GQA group.  A sink is an extra
+                        // softmax logit with no associated V vector.
+                        const int q_head = kvh_base_head + (int)(i / n_queries);
+                        kmax[i] = sinks[q_head];
+                        ksum[i] = 1.0f;
+                    } else {
+                        kmax[i] = neg_inf;
+                        ksum[i] = 0.0f;
+                    }
                 }
                 if (i < n_vacc) {
                     vacc[i] = 0.0f;
@@ -160,7 +171,7 @@ static void mkl_fa_online_softmax_chunk(
                 int64_t m_stride = 0;
                 if (mask_data) {
                     int m_head = (mask_n_heads > 1)
-                        ? (kvh_head + gqa_group) : 0;
+                        ? ((kvh_head + gqa_group) % mask_n_heads) : 0;
                     mask_h   = mask_data + (int64_t)m_head * mask_head_stride;
                     m_stride = mask_row_stride;
                 }
@@ -187,7 +198,7 @@ static void mkl_fa_online_softmax_chunk(
                 // Rescale previous accumulator by exp(old_max - new_max)
                 float old_max = KQ_max[jc_abs];
                 float new_max = (old_max > final_local_max) ? old_max : final_local_max;
-                float rescale = (old_max < -1e29f) ? 1.0f
+                float rescale = (KQ_sum[jc_abs] == 0.0f) ? 1.0f
                     : sycl::native::exp(old_max - new_max);
                 for (int v = local_id; v < DV; v += local_size) {
                     vkq[v] *= rescale;
@@ -361,6 +372,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
@@ -425,11 +437,11 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     if (do_print) {
         GGML_LOG_INFO("[MKL-FA] #%d D=%d DV=%d n_q=%d n_kv=%d "
                 "n_qh=%d n_kvh=%d gqa=%d batch=%d K=%s V=%s "
-                "chunk=%d buf=%.1fMB%s%s\n",
+                "chunk=%d mask_heads=%d sinks=%d buf=%.1fMB%s%s\n",
                 mkl_call_count, DKQ, DV, n_queries, n_kv,
                 n_q_heads, n_kv_heads, gqa_ratio, n_batch,
                 ggml_type_name(K->type), ggml_type_name(V->type),
-                chunk_size,
+                chunk_size, mask ? (int)mask->ne[2] : 0, sinks != nullptr,
                 (double)((int64_t)n_query_rows * chunk_size * sizeof(float))
                     / (1024.0 * 1024.0),
                 k_early_interleaved ? " K_ILV" : "",
@@ -537,7 +549,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
 
         const sycl::half * mask_batch = nullptr;
         if (mask) {
-            int m_batch = (mask->ne[3] > 1) ? ib : 0;
+            int m_batch = (mask->ne[3] > 1) ? (ib % (int)mask->ne[3]) : 0;
             mask_batch = (const sycl::half *)mask->data
                 + m_batch * (mask->nb[3] / 2);  // 2 = actual fp16 device size
         }
@@ -555,7 +567,9 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
             // 2. Initialize softmax state (full n_query_rows)
             mkl_fa_init_softmax_state(stream,
                 KQ_max_ptr, KQ_sum_ptr, VKQ_accum_ptr,
-                n_query_rows, DV, wg_size);
+                n_query_rows, n_queries, kvh_base_head,
+                sinks ? (const float *)sinks->data : nullptr,
+                DV, wg_size);
 
             // 3. KV chunk loop (OUTER): dequant each chunk once, then tile queries.
             for (int chunk_start = 0; chunk_start < n_kv; chunk_start += chunk_size) {
