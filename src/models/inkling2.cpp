@@ -123,13 +123,37 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
     return ggml_scale(ctx0, ggml_l2_norm(ctx0, cur, threshold), threshold);
 }
 
-ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
-    auto * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
-    for (auto * block : blocks) {
-        states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
+// The normalized states of a list, last first: [norm(l_n-1), ..., norm(l_0)].
+// Cache each prefix so blocks shared by multiple mix() calls are normalized and
+// concatenated only once while this graph is being built.
+ggml_tensor * llama_model_inkling2::graph::mix_stack(const std::vector<ggml_tensor *> & list) {
+    GGML_ASSERT(!list.empty());
+
+    const auto it = mix_stacks.find(list);
+    if (it != mix_stacks.end()) {
+        return it->second;
     }
-    states = ggml_rms_norm(ctx0, states, 1e-6f);
-    auto * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+
+    auto * res = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, list.back(), n_embd, 1, n_tokens), 1e-6f);
+    if (list.size() > 1) {
+        res = ggml_concat(ctx0, res, mix_stack(std::vector<ggml_tensor *>(list.begin(), list.end() - 1)), 1);
+    }
+
+    mix_stacks.emplace(list, res);
+    return res;
+}
+
+// Attention over depth: mix the earlier block outputs and cur with learned queries.
+ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+    // [norm(b_n-1), ..., norm(b_0), norm(cur)]
+    auto * states = mix_stack({cur});
+    if (!blocks.empty()) {
+        states = ggml_concat(ctx0, mix_stack(blocks), states, 1);
+    }
+
+    // With one token, query already has the target shape; avoid an identity repeat.
+    auto * queries = n_tokens == 1 ? query :
+        ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
     auto * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
     return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
@@ -175,7 +199,12 @@ ggml_tensor * llama_model_inkling2::graph::convolve(ggml_tensor * cur, ggml_tens
 }
 
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
-    auto * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
+    // Normalize cur and message as separate rows of one 3D tensor. RMS norm
+    // operates along ne[0], so this is equivalent to two independent norms.
+    auto * gate = ggml_concat(ctx0,
+            ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens),
+            ggml_reshape_3d(ctx0, message, n_embd, 1, n_tokens), 1);
+    gate = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, gate, 1e-6f), 2*n_embd, n_tokens);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
     auto * gain = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl], gate));
     auto * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
@@ -275,7 +304,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     bias = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_4d(ctx0, bias, nh, n_kv, n_tokens/streams, streams), 2, 0, 1, 3));
 
     // The sink is now represented in the bias; retain a zero-valued sink slot for softmax.
-    sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, nh), 0.0f);
+    // Reuse one zero tensor per head count across all attention layers in this graph.
+    auto *& zero_sink = zero_sinks[nh];
+    if (zero_sink == nullptr) {
+        zero_sink = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, nh), 0.0f);
+    }
+    sinks = zero_sink;
 
     // Flash attention requires an F16 mask; both paths consume the bias as part of the mask.
     auto * kq_mask = ggml_cast(ctx0, mask, GGML_TYPE_F32);
