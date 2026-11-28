@@ -5149,7 +5149,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_tool_calls({
                 { "special_function", R"({"arg1":1})", "" },
             })
-            .expect_rules({ "tool-0" })
+            .expect_rules({ "tool-calls" })
             .run();
 
         // Thinking, content, then a tool call
@@ -5191,6 +5191,35 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
             .tools({ special_function_tool })
             .expect(simple_assist_msg("", "I should call it", "special_function", R"({"arg1":1})", ""))
+            .expect_rules({ "tool-0" })
+            .run();
+
+        // Research-model format: the tool name appears only in the JSON body.
+        for (const auto tool_choice : { COMMON_CHAT_TOOL_CHOICE_AUTO, COMMON_CHAT_TOOL_CHOICE_REQUIRED }) {
+            tst.test(P + "<|content_invoke_tool_json|>{\"name\":\"special_function\",\"args\":{\"arg1\":1}}" + E)
+                .tool_choice(tool_choice)
+                .tools({ special_function_tool })
+                .expect_tool_calls({
+                    { "special_function", R"({"arg1":1})", "" },
+                })
+                .run();
+        }
+
+        // Automatic tool parsing accepts whitespace in the JSON envelope and
+        // preserves unknown names for the caller to validate.
+        tst.test(P + "unknown_tool<|content_invoke_tool_json|>{\"name\": \"unknown_tool\", \"args\": {\"arg1\": 1}}" + E)
+            .tools({ special_function_tool })
+            .expect_tool_calls({
+                { "unknown_tool", R"({"arg1": 1})", "" },
+            })
+            .run();
+
+        // The JSON name is authoritative if a legacy prefix is present but differs.
+        tst.test(P + "special<|content_invoke_tool_json|>{\"name\":\"special_function\",\"args\":{\"arg1\":1}}" + E)
+            .tools({ special_function_tool })
+            .expect_tool_calls({
+                { "special_function", R"({"arg1":1})", "" },
+            })
             .run();
 
         // Response format

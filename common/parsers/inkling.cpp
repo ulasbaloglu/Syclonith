@@ -48,7 +48,8 @@ static void inkling_split_media(common_chat_prompt & prompt) {
 // Inkling 1 and 2 - the assistant turn is a list of blocks, all closed by <|end_message|>:
 //   <|message_model|><|content_thinking|>...<|end_message|>
 //   <|message_model|><|content_text|>...<|end_message|>
-//   <|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}<|end_message|>
+//   <|message_model|>[NAME]<|content_invoke_tool_json|>{"name":"NAME","args":{...}}<|end_message|>
+//   The name prefix is optional; the JSON "name" member is authoritative.
 common_chat_params common_chat_params_init_inkling(const common_chat_template &          tmpl,
                                                    const autoparser::generation_params & inputs) {
     common_chat_params data;
@@ -101,8 +102,9 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
 
     data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
-        auto header = p.literal(HEADER);
-        auto end    = p.literal(END);
+        auto header   = p.literal(HEADER);
+        auto end      = p.literal(END);
+        auto tool_json = p.literal(TOOL_JSON);
 
         auto think    = p.literal(THINK);
         auto thinking = p.rule("thinking", extract_reasoning ? think + p.reasoning(p.until(END)) + end :
@@ -120,26 +122,47 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
             return blocks;
         }
 
-        auto tool_choice = p.choice();
-        foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
-            const auto & function = tool.at("function");
-            std::string  name     = function.at("name");
-
-            auto open = p.tool_name(p.literal(name)) + p.literal(TOOL_JSON) + p.literal("{\"name\":" + json(name).dump() + ",\"args\":");
-            auto args = p.tool_args(p.json());
-
-            tool_choice |= p.rule("tool-" + std::to_string(tool_index), p.tool(p.tool_open(open) + args + p.tool_close(p.literal("}")) + end));
-        });
-
-        // tool calls are the last blocks of the turn
-        auto calls      = inputs.parallel_tool_calls ? tool_choice + p.zero_or_more(header + tool_choice) : tool_choice;
-        auto tool_calls = header + p.trigger_rule("tool-calls", calls);
+        // In the newer Inkling output format, the authoritative tool name is in
+        // the JSON "name" member. Some model versions also emit a name before
+        // TOOL_JSON; accept that prefix, but do not use it to identify the tool.
+        auto tool_body = [&](const common_peg_parser & json_name) {
+            auto quoted_name = p.literal("\"") + p.tool_name(json_name) + p.literal("\"");
+            auto name_member = p.json_member("name", quoted_name);
+            auto args_member = p.json_member("args", p.tool_args(p.json()));
+            return p.tool_open(p.literal("{")) << name_member << p.literal(",") << args_member <<
+                   p.tool_close(p.literal("}")) + end;
+        };
 
         if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
-            return blocks + tool_calls;
+            // Forced tool choice must remain restricted to the tools supplied by
+            // the caller. The name prefix is optional in the newer model format.
+            auto tool_choice = p.choice();
+            foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
+                const auto & function = tool.at("function");
+                const std::string name = function.at("name");
+                const std::string quoted = json(name).dump();
+                const auto json_name = p.literal(quoted.substr(1, quoted.size() - 2));
+
+                tool_choice |= p.rule(
+                    "tool-" + std::to_string(tool_index),
+                    p.tool(p.optional(p.literal(name)) + tool_json + tool_body(json_name)));
+            });
+
+            auto calls = inputs.parallel_tool_calls ?
+                tool_choice + p.zero_or_more(header + tool_choice) : tool_choice;
+            return blocks + header + calls;
         }
 
-        return blocks + p.optional(tool_calls);
+        // Automatic tool choice: leave ordinary text unconstrained until the
+        // actual tool marker appears. This supports both legacy NAME+TOOL_JSON
+        // and the research-model form TOOL_JSON{"name":"..."...}.
+        auto name = p.until(TOOL_JSON);
+        auto body = tool_body(p.string_content('"'));
+        auto next = p.rule("tool-call", header + p.tool(name + tool_json + body));
+        auto more = inputs.parallel_tool_calls ? p.zero_or_more(next) : p.eps();
+        auto calls = header + name + p.trigger_rule("tool-calls", tool_json + body + more);
+
+        return blocks + p.optional(calls);
     });
 
     if (has_response_format || use_tools) {
@@ -149,15 +172,11 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
         });
 
         if (data.grammar_lazy) {
-            // a header followed by text and not by a content token is a tool call, the grammar starts at the name
+            // TOOL_JSON is the point at which both legacy and JSON-name-first
+            // tool calls become unambiguous. It is already in preserved_tokens.
             data.grammar_triggers = {
-                { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, "<\\|message_model\\|>([^<])" },
+                { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, TOOL_JSON },
             };
-            // Inkling 1: the first header is in the generation prompt, and a lazy grammar does not get the prompt.
-            // an output that starts with no content token is a tool call. not for a continuation, it starts with text
-            if (!inputs.has_continuation()) {
-                data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL, "[^<]+" });
-            }
         }
     }
 
