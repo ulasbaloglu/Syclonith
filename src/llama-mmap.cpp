@@ -329,10 +329,12 @@ struct llama_file::impl {
                 throw std::runtime_error("unexpectedly reached end of file");
             }
         } else {
+#ifdef __linux__
             if (use_bounce) {
                 read_bounce(ptr, len);
                 return;
             }
+#endif
             size_t bytes_read = 0;
             while (bytes_read < len) {
                 const size_t to_read = len - bytes_read;
@@ -344,12 +346,14 @@ struct llama_file::impl {
                     }
                     // Fallback to std::fread in case the DMA controller cannot access the buffer
                     // LLAMA_DIO_BOUNCE=1: keep direct IO, read through a normal buffer (pinned GPU staging memory gives EFAULT)
+#ifdef __linux__
                     if (errno == EFAULT && bytes_read == 0 && getenv("LLAMA_DIO_BOUNCE") && atoi(getenv("LLAMA_DIO_BOUNCE"))) {
                         LLAMA_LOG_WARN("%s: direct IO into this buffer failed (%s), using a bounce buffer\n", __func__, strerror(errno));
                         use_bounce = true;
                         read_bounce(ptr, len);
                         return;
                     }
+#endif
                     if (errno == EFAULT || errno == EINVAL) {
                         LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
                         auto curr_off = tell();

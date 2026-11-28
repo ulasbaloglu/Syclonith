@@ -588,6 +588,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_QSA_SELECT,
+        GGML_OP_TOP_K_MASK,
 
         GGML_OP_UNARY,
 
@@ -2859,6 +2860,20 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // top-k sparse attention mask: keep mask cells of live picks and extra cells, set the rest to -inf
+    // mask: [n_kv, m1, m2, m3] f16/f32, broadcast to top_k rows
+    // top_k: [n_top, ne1, ne2, ne3] i32
+    // score: [n_pick, ne1, ne2, ne3] f32, optional; picks with score == -inf are ignored
+    // blocks: [n_blk, n_pick] i32, optional; maps picks to mask cells
+    // extra: [n_extra, ne1, ne2, ne3] i32, optional; additional cells to keep
+    GGML_API struct ggml_tensor * ggml_top_k_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * extra);
 
     // custom operators
 
